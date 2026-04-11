@@ -1,0 +1,32 @@
+# TerraForge Mining Intelligence — Pipeline Configuration
+# All thresholds referenced by the application. Edit here; app reloads on restart.
+
+# ── Coregistration ────────────────────────────────────────────────────────────
+coreg_rmse_threshold: 0.5          # pixels — hard stop above this
+
+# ── ML Quality Gates ─────────────────────────────────────────────────────────
+min_oa_threshold: 0.80             # overall accuracy — block export below this
+min_minority_f1: 0.70              # minority class F1 — block export below this
+
+# ── Drift Monitor ────────────────────────────────────────────────────────────
+drift_alert_pct: 20                # % class area change vs previous run → anomaly flag
+
+# ── Post-processing ──────────────────────────────────────────────────────────
+min_mapping_unit_ha: 0.5           # sieve filter default (ha)
+
+# ── ML Training ──────────────────────────────────────────────────────────────
+default_k_folds: 5
+smote_auto_threshold_pct: 10       # any class < 10% total → auto-suggest SMOTE
+
+# ── Ingestion Validation ─────────────────────────────────────────────────────
+max_date_gap_days: 30              # warn if layer acquisition dates differ by > this
+min_overlap_pct: 80.0              # error if spatial overlap < this %
+max_resolution_ratio: 2.0          # warn if GSD ratio between layers > this
+phenology_month_gap: 2             # warn if layers span more than this many calendar months
+
+# ── Feature Engineering ──────────────────────────────────────────────────────
+corr_flag_threshold: 0.95          # flag feature pairs with |r| strictly above this (> not >=)
+
+# ── File handling ────────────────────────────────────────────────────────────
+upload_size_limit_mb: 500
+tmp_dir: tmp                       # relative to project root

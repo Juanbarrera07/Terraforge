@@ -1,0 +1,28 @@
+[
+  {
+    "timestamp": "2026-04-11T03:37:38.313237+00:00",
+    "run_id": "355E335E",
+    "event_type": "run_start",
+    "details": {
+      "action": "new_run_via_button"
+    }
+  },
+  {
+    "timestamp": "2026-04-11T03:38:11.935568+00:00",
+    "run_id": "355E335E",
+    "event_type": "error",
+    "details": {
+      "file": "DSM1.tif",
+      "error": "'PosixPath' object has no attribute 'seek'"
+    }
+  },
+  {
+    "timestamp": "2026-04-11T03:40:41.276917+00:00",
+    "run_id": "355E335E",
+    "event_type": "error",
+    "details": {
+      "file": "DSM1.tif",
+      "error": "'PosixPath' object has no attribute 'seek'"
+    }
+  }
+]

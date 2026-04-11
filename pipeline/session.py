@@ -1,0 +1,112 @@
+"""
+Streamlit session state schema + helpers.
+
+All session state keys are defined here as the single source of truth.
+Use get() / set_() to access state rather than indexing st.session_state
+directly — this avoids magic-string bugs across modules.
+
+Pipeline stages (in order)
+--------------------------
+ingestion → preprocessing → features → classification → postprocess → export
+
+A stage is "unlocked" once the previous stage completes all critical gates.
+"""
+from __future__ import annotations
+
+import uuid
+from typing import Any
+
+import streamlit as st
+
+# Ordered list of pipeline stages
+PIPELINE_STAGES: list[str] = [
+    "ingestion",
+    "preprocessing",
+    "features",
+    "classification",
+    "postprocess",
+    "export",
+]
+
+# Default values for every session key.
+# None means "not yet populated"; callers must check before use.
+_DEFAULTS: dict[str, Any] = {
+    "run_id": None,
+    "raw_data": None,               # dict[str, LayerDict]  — from ingest.py
+    "validation_results": None,     # dict[str, ValidationResult] — from validate.py
+    "preprocessed": None,           # dict  — after preprocess.py
+    "features": None,               # dict  — after features.py
+    "model": None,                  # trained model object
+    "classified": None,             # classified raster path
+    "accuracy": None,               # accuracy metrics dict
+    "audit_log": None,              # list[dict] — mirrored from logs/
+    "config": None,                 # loaded pipeline config dict
+    "pipeline_unlocked": None,      # set[str] of unlocked stage names
+    "previous_class_areas": None,   # dict — for drift monitor
+    "coreg_results":        None,   # dict[str, CoregistrationResult] — from preprocessing
+    "class_areas":          None,   # ClassAreaResult — from postprocess
+    "export_manifest":      None,   # ExportManifest — from export
+}
+
+
+def init_session(config: dict) -> None:
+    """
+    Idempotent initialiser — only sets keys that are absent from session state.
+    Call once at the top of app.py on every Streamlit run.
+    """
+    for key, default in _DEFAULTS.items():
+        if key not in st.session_state:
+            st.session_state[key] = default
+
+    if st.session_state.config is None:
+        st.session_state.config = config
+
+    if st.session_state.pipeline_unlocked is None:
+        st.session_state.pipeline_unlocked = {"ingestion"}
+
+
+def new_run() -> str:
+    """
+    Generate a new run ID and reset all pipeline-specific state.
+    Returns the new run_id string.
+    """
+    run_id = uuid.uuid4().hex[:8].upper()
+    st.session_state.run_id = run_id
+    st.session_state.raw_data = {}
+    st.session_state.validation_results = {}
+    st.session_state.preprocessed = None
+    st.session_state.features = None
+    st.session_state.model = None
+    st.session_state.classified = None
+    st.session_state.accuracy = None
+    st.session_state.audit_log = []
+    st.session_state.pipeline_unlocked = {"ingestion"}
+    st.session_state.previous_class_areas = None
+    st.session_state.coreg_results        = None
+    st.session_state.class_areas          = None
+    st.session_state.export_manifest      = None
+    return run_id
+
+
+def unlock_stage(stage: str) -> None:
+    """Mark a pipeline stage as accessible."""
+    if stage in PIPELINE_STAGES:
+        unlocked: set = st.session_state.pipeline_unlocked or set()
+        unlocked.add(stage)
+        st.session_state.pipeline_unlocked = unlocked
+
+
+def is_unlocked(stage: str) -> bool:
+    """Return True if the given stage has been unlocked."""
+    unlocked = st.session_state.get("pipeline_unlocked") or set()
+    return stage in unlocked
+
+
+def get(key: str, default: Any = None) -> Any:
+    """Safe session state getter with an explicit default."""
+    return st.session_state.get(key, default)
+
+
+def set_(key: str, value: Any) -> None:
+    """Set a session state key."""
+    st.session_state[key] = value

@@ -1,0 +1,195 @@
+[
+  {
+    "timestamp": "2026-04-11T04:04:29.541134+00:00",
+    "run_id": "30FA3C12",
+    "event_type": "run_start",
+    "details": {
+      "action": "new_run_via_button"
+    }
+  },
+  {
+    "timestamp": "2026-04-11T04:04:48.095216+00:00",
+    "run_id": "30FA3C12",
+    "event_type": "ingestion",
+    "details": {
+      "file": "DSM1.tif",
+      "sensor": "DEM",
+      "type": "dem",
+      "crs": "7850",
+      "bands": 1
+    }
+  },
+  {
+    "timestamp": "2026-04-11T04:04:48.103196+00:00",
+    "run_id": "30FA3C12",
+    "event_type": "gate",
+    "details": {
+      "gate": "ingestion_validation",
+      "summary": {
+        "ok": 4,
+        "warn": 1,
+        "error": 0
+      },
+      "checks": {
+        "crs_match": "ok",
+        "resolution_compatibility": "ok",
+        "date_proximity": "warn",
+        "minimum_overlap": "ok",
+        "band_count_dem__DSM1.tif": "ok"
+      }
+    },
+    "decision": "proceed"
+  },
+  {
+    "timestamp": "2026-04-11T04:11:19.612740+00:00",
+    "run_id": "30FA3C12",
+    "event_type": "ingestion",
+    "details": {
+      "file": "Rastermines.tif",
+      "sensor": "Multispectral RGB/RGBN",
+      "type": "optical",
+      "crs": "7850",
+      "bands": 4
+    }
+  },
+  {
+    "timestamp": "2026-04-11T04:11:19.640422+00:00",
+    "run_id": "30FA3C12",
+    "event_type": "ingestion",
+    "details": {
+      "file": "DSM1.tif",
+      "sensor": "DEM",
+      "type": "dem",
+      "crs": "7850",
+      "bands": 1
+    }
+  },
+  {
+    "timestamp": "2026-04-11T04:11:19.647340+00:00",
+    "run_id": "30FA3C12",
+    "event_type": "gate",
+    "details": {
+      "gate": "ingestion_validation",
+      "summary": {
+        "ok": 4,
+        "warn": 2,
+        "error": 0
+      },
+      "checks": {
+        "crs_match": "ok",
+        "resolution_compatibility": "warn",
+        "date_proximity": "warn",
+        "minimum_overlap": "ok",
+        "band_count_optical__Rastermines.tif": "ok",
+        "band_count_dem__DSM1.tif": "ok"
+      }
+    },
+    "decision": "proceed"
+  },
+  {
+    "timestamp": "2026-04-11T04:12:07.709121+00:00",
+    "run_id": "30FA3C12",
+    "event_type": "decision",
+    "details": {
+      "action": "unlock_preprocessing",
+      "warnings": 2
+    },
+    "decision": "proceed"
+  },
+  {
+    "timestamp": "2026-04-11T04:15:30.631157+00:00",
+    "run_id": "30FA3C12",
+    "event_type": "gate",
+    "details": {
+      "stage": "dos1",
+      "layer": "optical__Rastermines.tif",
+      "output": "tmp/30FA3C12/preprocessing/Rastermines_dos1.tif"
+    },
+    "decision": "proceed"
+  },
+  {
+    "timestamp": "2026-04-11T04:16:21.101766+00:00",
+    "run_id": "30FA3C12",
+    "event_type": "gate",
+    "details": {
+      "stage": "coregistration",
+      "layer": "optical__Rastermines.tif",
+      "shift_x_px": 0.0,
+      "shift_y_px": 0.0,
+      "shift_magnitude": 0.0,
+      "rmse_px": 0.0,
+      "gate_passed": true,
+      "backend": "stub",
+      "output_path": "tmp/30FA3C12/preprocessing/Rastermines_dos1_coreg.tif",
+      "message": "Stub coregistration: AROSICS not installed. Source raster copied without modification. Install arosics (conda-forge) to enable real coregistration."
+    },
+    "decision": "proceed"
+  },
+  {
+    "timestamp": "2026-04-11T04:16:31.398228+00:00",
+    "run_id": "30FA3C12",
+    "event_type": "decision",
+    "details": {
+      "action": "unlock_features",
+      "preprocessed_layers": [
+        "optical__Rastermines.tif"
+      ],
+      "coreg_gate_passed": true
+    },
+    "decision": "proceed"
+  },
+  {
+    "timestamp": "2026-04-11T04:21:34.133572+00:00",
+    "run_id": "30FA3C12",
+    "event_type": "gate",
+    "details": {
+      "stage": "feature_engineering",
+      "features": [
+        "vari"
+      ],
+      "n_high_corr_pairs": 0,
+      "output": "tmp/30FA3C12/features/30FA3C12_feature_stack.tif"
+    },
+    "decision": "proceed"
+  },
+  {
+    "timestamp": "2026-04-11T04:22:48.829738+00:00",
+    "run_id": "30FA3C12",
+    "event_type": "gate",
+    "details": {
+      "stage": "feature_engineering",
+      "features": [
+        "slope",
+        "aspect"
+      ],
+      "n_high_corr_pairs": 0,
+      "output": "tmp/30FA3C12/features/30FA3C12_feature_stack.tif"
+    },
+    "decision": "proceed"
+  },
+  {
+    "timestamp": "2026-04-11T04:23:08.114386+00:00",
+    "run_id": "30FA3C12",
+    "event_type": "decision",
+    "details": {
+      "action": "unlock_classification",
+      "feature_path": "tmp/30FA3C12/features/30FA3C12_feature_stack.tif",
+      "n_features": 2
+    },
+    "decision": "proceed"
+  },
+  {
+    "timestamp": "2026-04-11T04:27:31.078306+00:00",
+    "run_id": "30FA3C12",
+    "event_type": "gate",
+    "details": {
+      "stage": "feature_engineering",
+      "features": [
+        "vari"
+      ],
+      "n_high_corr_pairs": 0,
+      "output": "tmp/30FA3C12/features/30FA3C12_feature_stack.tif"
+    },
+    "decision": "proceed"
+  }
+]

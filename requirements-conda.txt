@@ -1,0 +1,27 @@
+# TerraForge — conda-forge packages (native C/C++ linked)
+# Install with:
+#   micromamba install -n terraforge -c conda-forge --file requirements-conda.txt --yes
+#
+# DO NOT install these with pip — ABI conflicts will cause silent failures.
+
+# ── Phase 1–2 (active) ───────────────────────────────────────────────────────
+gdal
+rasterio
+fiona
+shapely
+pyproj
+geopandas
+numpy
+pandas
+pyyaml
+
+# ── Phase 3 ───────────────────────────────────────────────────────────────────
+# arosics
+# scipy
+
+# ── Phase 4 ───────────────────────────────────────────────────────────────────
+# scikit-image
+
+# ── Phase 5 ───────────────────────────────────────────────────────────────────
+# scikit-learn
+# xgboost

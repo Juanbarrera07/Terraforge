@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Conda / env
+.env
+.venv
+env/
+terraforge/
+
+# Data (MUY IMPORTANTE)
+*.tif
+*.tiff
+*.zip
+*.gpkg
+*.shp
+*.dbf
+*.shx
+*.cpg
+
+# Outputs
+tmp/
+outputs/
+*.log
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
