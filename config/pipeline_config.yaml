@@ -27,6 +27,10 @@ phenology_month_gap: 2             # warn if layers span more than this many cal
 # ── Feature Engineering ──────────────────────────────────────────────────────
 corr_flag_threshold: 0.95          # flag feature pairs with |r| strictly above this (> not >=)
 
+# ── SAR preprocessing ────────────────────────────────────────────────────────
+sar_enl_default: 1.0              # single-look conservative default
+sar_enl_sentinel1_iw: 4.9        # Sentinel-1 IW mode typical ENL
+
 # ── File handling ────────────────────────────────────────────────────────────
 upload_size_limit_mb: 500
 tmp_dir: tmp                       # relative to project root

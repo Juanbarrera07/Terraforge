@@ -23,6 +23,7 @@ from pipeline.validate import (
     check_band_counts,
     check_crs_match,
     check_date_proximity,
+    check_label_alignment,
     check_minimum_overlap,
     check_resolution_compatibility,
     has_critical_failures,
@@ -359,3 +360,76 @@ class TestRunAllValidations:
                   "min_overlap_pct": 80.0, "phenology_month_gap": 2}
         results = run_all_validations(layers, config)
         assert has_critical_failures(results) is True
+
+
+# ── check_label_alignment ─────────────────────────────────────────────────────
+
+class TestCheckLabelAlignment:
+    """
+    Tests for check_label_alignment().
+
+    Uses lightweight in-memory meta dicts (no raster files needed) because
+    check_label_alignment() operates purely on metadata fields: crs, transform,
+    and res — exactly what raster_io.get_meta() returns.
+    """
+
+    @staticmethod
+    def _meta(
+        epsg: int | None = 32633,
+        res: float = 10.0,
+        x_origin: float = 500_000.0,
+        y_origin: float = 5_000_200.0,
+    ) -> dict:
+        """Build a minimal meta dict compatible with check_label_alignment."""
+        from rasterio.crs import CRS
+        from rasterio.transform import from_origin
+        crs = CRS.from_epsg(epsg) if epsg is not None else None
+        transform = from_origin(x_origin, y_origin, res, res)
+        return {"crs": crs, "transform": transform, "res": (res, res)}
+
+    def test_label_aligned_passes(self) -> None:
+        """Identical metas — all three sub-checks pass."""
+        meta = self._meta()
+        result = check_label_alignment(meta, meta)
+        assert result.status == "ok"
+        assert result.check == "label_alignment"
+        assert not result.is_critical
+
+    def test_label_crs_mismatch_fails(self) -> None:
+        """Different CRS → critical error."""
+        label = self._meta(epsg=4326)
+        feat  = self._meta(epsg=32633)
+        result = check_label_alignment(label, feat)
+        assert result.status == "error"
+        assert result.is_critical
+        assert "CRS mismatch" in result.message
+
+    def test_label_resolution_mismatch_fails(self) -> None:
+        """label_res=30 vs feat_res=10 — far outside 0.5 px tolerance → critical error."""
+        label = self._meta(res=30.0)
+        feat  = self._meta(res=10.0)
+        result = check_label_alignment(label, feat)
+        assert result.status == "error"
+        assert result.is_critical
+        assert "Resolution mismatch" in result.message
+
+    def test_label_extent_mismatch_fails(self) -> None:
+        """
+        Origin displaced 6 m (> 0.5 px × 10 m/px = 5 m tolerance) → critical error.
+        """
+        feat  = self._meta()
+        label = self._meta(x_origin=500_006.0)  # 6 m shift > 5 m tolerance
+        result = check_label_alignment(label, feat)
+        assert result.status == "error"
+        assert result.is_critical
+        assert "origin mismatch" in result.message.lower()
+
+    def test_label_tolerance_passes(self) -> None:
+        """
+        Origin displaced 1 m (0.1 px at 10 m/px, well within 0.5 px tolerance) → ok.
+        """
+        feat  = self._meta()
+        label = self._meta(x_origin=500_001.0)  # 1 m shift < 5 m tolerance
+        result = check_label_alignment(label, feat)
+        assert result.status == "ok"
+        assert not result.is_critical

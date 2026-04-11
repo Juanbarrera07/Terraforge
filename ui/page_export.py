@@ -37,6 +37,7 @@ from pipeline.export import (
     write_cog,
     write_stac_item,
 )
+from pipeline.report import generate_report
 from ui._helpers import run_output_dir
 
 
@@ -199,13 +200,71 @@ def render() -> None:
                 {"stage": "export_build", "errors": build_errors},
             )
 
-    # ── C: Package into ZIP ───────────────────────────────────────────────
+    # ── C: PDF Report ─────────────────────────────────────────────────────
     st.divider()
-    st.subheader("C — Package ZIP Archive")
+    st.subheader("C — Reporte PDF Técnico")
+    st.caption(
+        "Genera un reporte técnico corporativo en PDF con métricas de clasificación, "
+        "preprocesamiento y log de auditoría completo."
+    )
 
-    # Collect all artifacts that actually exist on disk
+    pdf_path = out_dir / f"{run_id}_report.pdf"
+    operator_name = st.text_input(
+        "Nombre del operador",
+        placeholder="Ej. Juan García — Geólogo Senior",
+        key="export_operator_name",
+        help="Se incluye en la portada del reporte. Puede dejarse en blanco.",
+    )
+
+    if st.button("📄 Generar Reporte PDF", key="run_pdf_report"):
+        with st.spinner("Generando reporte PDF…"):
+            try:
+                # Build a snapshot of session data — primitives and dataclasses only
+                session_snapshot = {
+                    "model":    session.get("model"),
+                    "accuracy": session.get("accuracy"),
+                    "areas":    session.get("areas"),
+                    "config":   session.get("config"),
+                }
+                generate_report(
+                    run_id        = run_id,
+                    session_data  = session_snapshot,
+                    out_path      = pdf_path,
+                    operator_name = operator_name.strip(),
+                )
+                st.success(f"Reporte generado → `{pdf_path.name}`", icon="✅")
+                audit.log_event(
+                    run_id, "gate",
+                    {
+                        "stage":    "report_generation",
+                        "operator": operator_name.strip() or "—",
+                        "output":   str(pdf_path),
+                    },
+                    decision="proceed",
+                )
+            except Exception as exc:
+                st.error(f"Error generando el reporte: {exc}", icon="❌")
+                audit.log_event(
+                    run_id, "error",
+                    {"stage": "report_generation", "error": str(exc)},
+                )
+
+    if pdf_path.exists():
+        st.download_button(
+            label     = f"⬇️  Descargar `{pdf_path.name}`",
+            data      = pdf_path.read_bytes(),
+            file_name = pdf_path.name,
+            mime      = "application/pdf",
+            key       = "download_pdf_report",
+        )
+
+    # ── D: Package into ZIP ───────────────────────────────────────────────
+    st.divider()
+    st.subheader("D — Package ZIP Archive")
+
+    # Collect all artifacts that actually exist on disk (PDF included if generated)
     candidate_artifacts = [
-        p for p in [cog_path, stac_path, audit_log_path]
+        p for p in [cog_path, stac_path, audit_log_path, pdf_path]
         if p.exists()
     ]
 
@@ -261,13 +320,13 @@ def render() -> None:
                         {"stage": "export_package", "error": str(exc)},
                     )
 
-    # ── D: Manifest display ───────────────────────────────────────────────
+    # ── E: Manifest display ───────────────────────────────────────────────
     manifest: ExportManifest | None = session.get("export_manifest")
     if manifest is None:
         return
 
     st.divider()
-    st.subheader("D — Export Manifest")
+    st.subheader("E — Export Manifest")
 
     col_rid, col_ts, col_zip = st.columns(3)
     col_rid.metric("Run ID",      manifest.run_id)
@@ -285,9 +344,9 @@ def render() -> None:
         f"All checksums are SHA-256"
     )
 
-    # ── E: Download ───────────────────────────────────────────────────────
+    # ── F: Download ───────────────────────────────────────────────────────
     st.divider()
-    st.subheader("E — Download")
+    st.subheader("F — Download")
 
     if manifest.zip_path.exists():
         # Read bytes only at button render time; not held in a variable
@@ -306,7 +365,7 @@ def render() -> None:
     else:
         st.warning("ZIP file not found on disk.", icon="⚠️")
 
-    # ── F: STAC item preview ──────────────────────────────────────────────
+    # ── G: STAC item preview ──────────────────────────────────────────────
     if stac_path.exists():
         with st.expander("STAC item JSON preview"):
             st.code(stac_path.read_text(encoding="utf-8"), language="json")

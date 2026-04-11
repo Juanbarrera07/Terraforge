@@ -150,6 +150,24 @@ def render() -> None:
         "Must match the spatial extent of the feature stack."
     )
 
+    st.info(
+        "El label.tif debe tener exactamente el mismo CRS, resolución y extensión "
+        "que el feature stack generado en el paso anterior. "
+        "La app lo validará automáticamente al subirlo.",
+        icon="📐",
+    )
+
+    with st.expander("ℹ️ ¿Qué debe ser el label.tif?"):
+        st.markdown(
+            """
+| Proceso | Formato label.tif | Notas |
+|---|---|---|
+| **Clasificación supervisada (RF/XGBoost)** | 1 banda, dtype `int16`/`uint8`, valores enteros por clase | `0` = nodata, `1..N` = clases. Debe estar reproyectado al mismo CRS y resolución que el feature stack |
+| **Detección de cambio** | No aplica — se usan dos runs consecutivos | El drift monitor compara áreas automáticamente |
+| **Accuracy assessment** | CSV con columnas: `lat`, `lon`, `class_id` | Archivo separado del label.tif |
+"""
+        )
+
     label_mode = st.radio(
         "Input mode",
         options=["Upload file", "Local file path"],

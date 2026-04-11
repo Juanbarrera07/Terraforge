@@ -273,6 +273,48 @@ class TestExportAuditLog:
         data = json.loads(out.read_text())
         assert data == []
 
+    def test_export_audit_log_survives_session_loss(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        export_audit_log() must recover all events from disk even when
+        append_to_session() was never called (simulates a session reload or
+        crash that wiped st.session_state.audit_log).
+
+        Strategy
+        --------
+        1. Redirect audit._LOGS_DIR to a temp directory so the test is
+           hermetically isolated from the project's real logs/ folder.
+        2. Call log_event() — writes to disk; deliberately skip
+           append_to_session() to simulate a "missing" in-memory mirror.
+        3. Call export_audit_log() and assert the exported JSON contains
+           the event written in step 2.
+        """
+        import pipeline.audit as audit_mod
+
+        # Redirect disk writes/reads to an isolated tmp subdirectory.
+        fake_logs_dir = tmp_path / "logs"
+        monkeypatch.setattr(audit_mod, "_LOGS_DIR", fake_logs_dir)
+
+        run_id = "SESS1234"
+        # Write one event to disk — intentionally do NOT call append_to_session.
+        audit_mod.log_event(
+            run_id=run_id,
+            event_type="gate",
+            details={"stage": "preprocessing", "check": "crs_match"},
+            decision="proceed",
+        )
+
+        # Export using export_audit_log, which reads via get_log() → _read() → disk.
+        out = export_audit_log(run_id, tmp_path / "exported_audit.json")
+        exported = json.loads(out.read_text())
+
+        assert isinstance(exported, list), "Exported log must be a JSON list"
+        assert len(exported) == 1, "Exactly one event was written — must appear in export"
+        assert exported[0]["event_type"] == "gate"
+        assert exported[0]["details"]["stage"] == "preprocessing"
+        assert exported[0]["decision"] == "proceed"
+
 
 # ── package_run ───────────────────────────────────────────────────────────────
 

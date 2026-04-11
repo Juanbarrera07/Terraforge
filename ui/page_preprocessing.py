@@ -161,7 +161,9 @@ def render() -> None:
         with col_enl:
             enl = st.number_input(
                 "ENL (Equivalent Number of Looks)",
-                min_value=0.5, max_value=20.0, value=1.0, step=0.5,
+                min_value=0.5, max_value=20.0,
+                value=float(cfg.get("sar_enl_default", 1.0)),
+                step=0.5,
                 key="lee_enl",
                 help="Higher ENL → less aggressive filtering. "
                      "1 = single-look (conservative).",

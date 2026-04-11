@@ -18,6 +18,7 @@ Critical checks (hard-block on failure)
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Optional
@@ -275,6 +276,119 @@ def check_band_counts(layers: dict[str, dict]) -> list[ValidationResult]:
             ))
 
     return results
+
+
+# ── Label alignment gate ──────────────────────────────────────────────────────
+
+def check_label_alignment(
+    label_meta: dict,
+    feature_meta: dict,
+    tolerance_px: float = 0.5,
+) -> ValidationResult:
+    """
+    Verify that a label raster is spatially aligned with the feature stack.
+
+    Three sub-checks are performed in order; the first failure short-circuits:
+
+    1. **CRS match** — both rasters must share the same coordinate reference system.
+    2. **Resolution match** — ``|label_res - feat_res| ≤ tolerance_px × feat_res``.
+    3. **Origin match** — Euclidean distance between the top-left corners of the
+       two rasters must be ≤ ``tolerance_px × feat_res`` (in CRS units).
+
+    A misaligned label causes silently wrong training data: the model trains
+    without error but with labels offset from the corresponding feature pixels.
+
+    Parameters
+    ----------
+    label_meta   : Metadata dict as returned by ``raster_io.get_meta()`` for
+                   the label raster.
+    feature_meta : Metadata dict as returned by ``raster_io.get_meta()`` for
+                   the feature stack raster.
+    tolerance_px : Allowed misalignment in pixels (default 0.5).  Applied to
+                   both resolution and origin checks.
+
+    Returns
+    -------
+    ValidationResult with ``is_critical=True`` on any failure.
+
+    Notes
+    -----
+    This function is intentionally **not** wired into ``run_all_validations()``
+    — it is called explicitly from ``page_classification.py`` when the user
+    uploads label.tif (Phase 5 UI).
+    """
+    check = "label_alignment"
+
+    # ── 1. CRS ────────────────────────────────────────────────────────────────
+    label_crs_key = _crs_key(label_meta.get("crs"))
+    feat_crs_key  = _crs_key(feature_meta.get("crs"))
+
+    if label_crs_key is None or feat_crs_key is None:
+        missing = []
+        if label_crs_key is None:
+            missing.append("label")
+        if feat_crs_key is None:
+            missing.append("feature stack")
+        return ValidationResult(
+            check, "error",
+            f"CRS is missing on: {', '.join(missing)}. "
+            "Assign a CRS before running alignment check.",
+            is_critical=True,
+        )
+
+    if label_crs_key != feat_crs_key:
+        return ValidationResult(
+            check, "error",
+            f"CRS mismatch: label has {label_crs_key}, "
+            f"feature stack has {feat_crs_key}. "
+            "Reproject label.tif to match the feature stack CRS before training.",
+            is_critical=True,
+            detail={"label_crs": label_crs_key, "feature_crs": feat_crs_key},
+        )
+
+    # ── 2. Resolution ─────────────────────────────────────────────────────────
+    feat_res  = abs(float(feature_meta["res"][0]))
+    label_res = abs(float(label_meta["res"][0]))
+    res_tol   = tolerance_px * feat_res
+
+    if abs(label_res - feat_res) > res_tol:
+        return ValidationResult(
+            check, "error",
+            f"Resolution mismatch: label {label_res:.4f} vs "
+            f"feature stack {feat_res:.4f} CRS units/px "
+            f"(tolerance: {tolerance_px:.1f} px = {res_tol:.4f} units). "
+            "Resample label.tif to match the feature stack resolution.",
+            is_critical=True,
+            detail={"label_res": label_res, "feat_res": feat_res,
+                    "tolerance_units": round(res_tol, 6)},
+        )
+
+    # ── 3. Origin (top-left corner) ───────────────────────────────────────────
+    lt = label_meta["transform"]
+    ft = feature_meta["transform"]
+    dist     = math.sqrt((lt.c - ft.c) ** 2 + (lt.f - ft.f) ** 2)
+    max_dist = tolerance_px * feat_res
+
+    if dist > max_dist:
+        return ValidationResult(
+            check, "error",
+            f"Spatial origin mismatch: label ({lt.c:.2f}, {lt.f:.2f}) vs "
+            f"feature stack ({ft.c:.2f}, {ft.f:.2f}) — "
+            f"offset {dist:.4f} units exceeds "
+            f"{tolerance_px:.1f} px = {max_dist:.4f} units. "
+            "Align label.tif to the feature stack grid before training.",
+            is_critical=True,
+            detail={"label_origin": (lt.c, lt.f), "feat_origin": (ft.c, ft.f),
+                    "distance": round(dist, 6), "max_dist": round(max_dist, 6)},
+        )
+
+    return ValidationResult(
+        check, "ok",
+        f"Label raster is spatially aligned with the feature stack "
+        f"(CRS: {feat_crs_key}, res: {feat_res:.4f}, "
+        f"origin offset: {dist:.4f} units).",
+        detail={"distance": round(dist, 6), "feat_res": feat_res},
+    )
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────

@@ -33,6 +33,9 @@ _DEFAULTS: dict[str, Any] = {
     "phenology_month_gap": 2,
     # Feature engineering
     "corr_flag_threshold": 0.95,
+    # SAR preprocessing
+    "sar_enl_default": 1.0,
+    "sar_enl_sentinel1_iw": 4.9,
     # File handling
     "upload_size_limit_mb": 500,
     "tmp_dir": "tmp",

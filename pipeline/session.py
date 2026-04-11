@@ -13,7 +13,9 @@ A stage is "unlocked" once the previous stage completes all critical gates.
 """
 from __future__ import annotations
 
+import shutil
 import uuid
+from pathlib import Path
 from typing import Any
 
 import streamlit as st
@@ -65,11 +67,53 @@ def init_session(config: dict) -> None:
         st.session_state.pipeline_unlocked = {"ingestion"}
 
 
+def _cleanup_run_tmp(run_id: str, tmp_dir: str | Path) -> None:
+    """
+    Remove ``tmp/{run_id}/`` for a completed or abandoned run.
+
+    - Best-effort: logs on error, never raises.
+    - Security: verifies the target is a direct child of *tmp_dir* before
+      calling shutil.rmtree, so a malformed run_id cannot escape the sandbox.
+    - Does NOT touch logs/ or outputs/ — only the tmp subtree.
+
+    Parameters
+    ----------
+    run_id  : The run identifier string (8-char hex, uppercase).
+    tmp_dir : Root tmp directory from config (e.g. ``"tmp"`` or ``Path("tmp")``).
+    """
+    if not run_id:
+        return
+
+    tmp_root = Path(tmp_dir).resolve()
+    target = (tmp_root / run_id).resolve()
+
+    # Security guard: target must be an immediate child of tmp_root.
+    try:
+        target.relative_to(tmp_root)
+    except ValueError:
+        print(f"[session] WARN: cleanup target {target} is outside {tmp_root} — skipped")
+        return
+
+    if not target.exists():
+        return
+
+    try:
+        shutil.rmtree(target)
+        print(f"[session] Cleaned tmp/{run_id}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[session] WARN: could not remove {target}: {exc}")
+
+
 def new_run() -> str:
     """
     Generate a new run ID and reset all pipeline-specific state.
+    Cleans up the previous run's tmp directory (best-effort).
     Returns the new run_id string.
     """
+    # Capture previous run context BEFORE resetting state.
+    old_run_id: str | None = st.session_state.get("run_id")
+    cfg: dict = st.session_state.get("config") or {}
+
     run_id = uuid.uuid4().hex[:8].upper()
     st.session_state.run_id = run_id
     st.session_state.raw_data = {}
@@ -85,6 +129,11 @@ def new_run() -> str:
     st.session_state.coreg_results        = None
     st.session_state.class_areas          = None
     st.session_state.export_manifest      = None
+
+    # Clean previous run's tmp — best-effort, never blocks the new run.
+    if old_run_id and cfg:
+        _cleanup_run_tmp(old_run_id, cfg.get("tmp_dir", "tmp"))
+
     return run_id
 
 

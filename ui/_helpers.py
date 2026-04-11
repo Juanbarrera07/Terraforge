@@ -5,6 +5,7 @@ All functions here are UI-layer helpers only — no pipeline logic.
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -39,13 +40,50 @@ def save_upload(uploaded_file, dest_dir: Path) -> Path:
 
 def make_progress_cb(bar: st.delta_generator.DeltaGenerator) -> ProgressCallback:
     """
-    Return a ProgressCallback that advances a ``st.progress`` bar.
+    Return a ProgressCallback that advances a ``st.progress`` bar with
+    real percentage and estimated time remaining.
 
     The callback signature matches all pipeline progress parameters:
     ``(current_tile: int, total_tiles: int) -> None``.
+
+    Progress text format
+    --------------------
+    ``Tile {current}/{total} — {pct}% | ETA: {eta_str}``
+
+    ``eta_str`` is:
+    - ``"calculando…"`` until the first tick has enough data
+    - ``"{N}s"``      for ETA < 60 seconds
+    - ``"{M}m {N}s"`` for ETA ≥ 60 seconds
+
+    Failures in ``bar.progress()`` (e.g. the user navigated away and
+    the widget no longer exists) are silently swallowed so the pipeline
+    is never interrupted by a dead progress bar.
     """
+    start_time: float = time.perf_counter()
+
+    def _eta_str(eta_seconds: float | None) -> str:
+        if eta_seconds is None:
+            return "calculando…"
+        eta_seconds = max(0.0, eta_seconds)
+        if eta_seconds < 60:
+            return f"{eta_seconds:.0f}s"
+        return f"{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s"
+
     def _cb(current: int, total: int) -> None:
-        bar.progress(current / max(total, 1))
+        safe_total = max(total, 1)
+        pct        = current / safe_total
+        elapsed    = time.perf_counter() - start_time
+        speed      = current / elapsed if elapsed > 0 else 0.0
+        eta        = (total - current) / speed if speed > 0 else None
+        text       = (
+            f"Tile {current}/{total} — {pct * 100:.0f}%"
+            f" | ETA: {_eta_str(eta)}"
+        )
+        try:
+            bar.progress(pct, text=text)
+        except Exception:  # noqa: BLE001 — widget may be gone if user navigated away
+            pass
+
     return _cb
 
 

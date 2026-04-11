@@ -350,9 +350,15 @@ def export_audit_log(
     """
     Copy the run's audit log to an export location.
 
-    Reads from the canonical log store via ``audit.get_log()`` and writes a
-    standalone JSON file.  The copy is self-contained: no reference back to the
-    ``logs/`` directory is needed to interpret it.
+    Reads from the canonical log store via ``audit.get_log()``, which always
+    reads from disk (``logs/{run_id}.json``) — never from Streamlit
+    session_state.  This means the export is **safe even after a session
+    reload or crash**: as long as the log file exists on disk, the full
+    event history will be captured regardless of whether
+    ``append_to_session()`` was ever called.
+
+    The written file is self-contained: no reference back to the ``logs/``
+    directory is needed to interpret it.
 
     Parameters
     ----------
