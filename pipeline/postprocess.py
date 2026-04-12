@@ -731,6 +731,57 @@ def median_smooth(
     return out_path
 
 
+def estimate_chain_time(
+    raster_path: Path,
+    cfg: dict,
+    pixel_res_m: float,
+) -> dict[str, float]:
+    """
+    Estimate processing time per step based on pixel count and kernel sizes.
+
+    Uses raster_io.get_meta() (zero pixel reads) to get dimensions.
+    Returns {step_name: estimated_seconds}.
+    If total > 300s, also returns key "warning" with a message string.
+
+    Empirical coefficients (μs/pixel):
+        confidence_filter  — 0.8
+        median_smooth      — 1.2
+        morphological_close— 0.6
+        sieve_filter       — 0.4  (GDAL is faster)
+    """
+    from pipeline.raster_io import get_meta as _get_meta  # noqa: PLC0415
+
+    meta       = _get_meta(raster_path)
+    n_pixels   = meta["width"] * meta["height"]
+    drone_mode = pixel_res_m < float(cfg.get("drone_pixel_res_threshold_m", 1.0))
+
+    # In drone_mode confidence_filter is skipped — zero cost
+    conf_coeff  = 0.0 if drone_mode and pixel_res_m < 0.5 else 0.8e-6
+    median_coeff = 1.2e-6
+    morpho_coeff = 0.6e-6
+    sieve_coeff  = 0.4e-6
+
+    morpho_iters = int(cfg.get("morphological_iterations", 1))
+    if drone_mode:
+        morpho_iters = int(cfg.get("drone_morpho_iterations", 2))
+
+    estimates = {
+        "confidence_filter":    n_pixels * conf_coeff,
+        "median_smooth":        n_pixels * median_coeff,
+        "morphological_close":  n_pixels * morpho_coeff * max(1, morpho_iters),
+        "sieve_filter":         n_pixels * sieve_coeff,
+    }
+
+    total = sum(estimates.values())
+    if total > 300:
+        estimates["warning"] = (
+            f"Large raster detected ({n_pixels:,} pixels). "
+            f"Estimated total: {total:.0f}s (~{total/60:.1f} min)."
+        )
+
+    return estimates
+
+
 def run_postprocess_chain(
     classified_path: str | Path,
     confidence_path: str | Path,
@@ -738,6 +789,9 @@ def run_postprocess_chain(
     out_dir:         str | Path,
     run_id:          str,
     progress:        Optional[Any] = None,
+    pixel_res_m:     float = 10.0,
+    drone_mode:      bool  = False,
+    cancel_event:    Optional[Any] = None,
 ) -> dict:
     """
     Run the 4-step post-classification filtering chain.
@@ -745,12 +799,15 @@ def run_postprocess_chain(
     Steps
     -----
     1. ``confidence_filter``   — Replace low-confidence pixels with local median.
+                                 Skipped in drone_mode when pixel_res_m < 0.5.
     2. ``median_smooth``       — Windowed median filter to reduce isolated pixels.
     3. ``morphological_close`` — Majority-vote morphological closing
                                  (repeated ``morphological_iterations`` times).
     4. ``sieve_filter``        — MMU enforcement via GDAL SieveFilter.
 
     Each step is logged to the audit trail via ``audit.log_event``.
+    Between steps, ``cancel_event`` is checked if provided — if set, the chain
+    stops and raises RuntimeError("Cancelled by user").
 
     Parameters
     ----------
@@ -760,21 +817,29 @@ def run_postprocess_chain(
                       ``confidence_threshold``, ``median_filter_size``,
                       ``morphological_kernel_size``, ``morphological_iterations``,
                       ``min_mapping_unit_ha``, ``sieve_connectivity``.
+                      Drone keys: ``drone_pixel_res_threshold_m``,
+                      ``drone_median_kernel_max``, ``drone_morpho_iterations``,
+                      ``drone_sieve_min_px``.
     out_dir         : Directory for intermediate and final outputs.
     run_id          : Active run identifier for audit logging.
     progress        : Optional callable(msg: str) invoked after each step.
+    pixel_res_m     : Ground sampling distance in metres.  Auto-read from CRS
+                      if the raster has a projected CRS.
+    drone_mode      : If True, apply drone-optimised parameter overrides.
+                      Auto-enabled if pixel_res_m < drone_pixel_res_threshold_m.
+    cancel_event    : Optional threading.Event; chain stops between steps if set.
 
     Returns
     -------
     dict with keys:
-        ``"confidence_filtered"``    — Path, output of step 1
+        ``"confidence_filtered"``    — Path, output of step 1 (or input if skipped)
         ``"median_smoothed"``        — Path, output of step 2
         ``"morphologically_closed"`` — Path, output of step 3
         ``"final"``                  — Path, output of step 4 (sieve)
 
     Raises
     ------
-    RuntimeError : If GDAL is not available (required for sieve step).
+    RuntimeError : If GDAL is not available or cancel_event is set.
     ValueError   : If the raster has a non-projected CRS (pixel_res_m cannot
                    be derived automatically).
     """
@@ -796,6 +861,8 @@ def run_postprocess_chain(
     mmu_ha         = float(cfg.get("min_mapping_unit_ha",      0.5))
     connectivity   = int(cfg.get("sieve_connectivity",         4))
 
+    drone_threshold_m = float(cfg.get("drone_pixel_res_threshold_m", 1.0))
+
     with rasterio.open(classified_path) as ds:
         if ds.crs and ds.crs.is_projected:
             pixel_res_m = float(abs(ds.transform.a))
@@ -805,50 +872,108 @@ def run_postprocess_chain(
                 "Reproject the classified raster to a projected CRS first."
             )
 
+    # Auto-detect drone mode
+    if pixel_res_m < drone_threshold_m:
+        drone_mode = True
+
+    # Apply drone-mode parameter overrides
+    skip_confidence_filter = False
+    if drone_mode:
+        drone_median_max  = int(cfg.get("drone_median_kernel_max",  7))
+        drone_morpho_iter = int(cfg.get("drone_morpho_iterations",  2))
+        drone_sieve_min   = int(cfg.get("drone_sieve_min_px",       100))
+
+        # Cap median kernel
+        median_k = max(3, min(drone_median_max, median_k))
+        if pixel_res_m < 0.1:
+            import warnings as _warnings
+            _warnings.warn(
+                f"Very high resolution drone data ({pixel_res_m:.3f} m/px). "
+                f"Median kernel capped at {median_k}px.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # More passes, smaller kernel
+        morpho_k     = 3
+        morpho_iters = drone_morpho_iter
+
+        # Guarantee minimum MMU of drone_sieve_min_px pixels
+        min_mmu_ha = (pixel_res_m ** 2) * drone_sieve_min / 10_000.0
+        mmu_ha     = max(mmu_ha, min_mmu_ha)
+
+        # Skip confidence filter for very-high-resolution drones
+        if pixel_res_m < 0.5:
+            skip_confidence_filter = True
+            _audit.log_event(
+                run_id, "gate",
+                {"stage": "chain_confidence_filter",
+                 "skipped": True,
+                 "reason": f"drone_mode + pixel_res_m={pixel_res_m:.3f} < 0.5"},
+                decision="proceed",
+            )
+
     results: dict = {}
 
     # ── Step 1: confidence filter ─────────────────────────────────────────────
-    conf_filtered = out_dir / f"{run_id}_chain_conf_filtered.tif"
-    confidence_filter(classified_path, confidence_path, conf_threshold, conf_filtered)
+    if skip_confidence_filter:
+        # Pass the original classified raster through unchanged
+        conf_filtered = classified_path
+    else:
+        conf_filtered = out_dir / f"{run_id}_chain_conf_filtered.tif"
+        confidence_filter(classified_path, confidence_path, conf_threshold, conf_filtered)
+        _audit.log_event(
+            run_id, "gate",
+            {"stage": "chain_confidence_filter", "threshold": conf_threshold,
+             "output": str(conf_filtered)},
+            decision="proceed",
+        )
     results["confidence_filtered"] = conf_filtered
-    _audit.log_event(
-        run_id, "gate",
-        {"stage": "chain_confidence_filter", "threshold": conf_threshold,
-         "output": str(conf_filtered)},
-        decision="proceed",
-    )
     if progress is not None:
         progress("confidence_filter complete")
 
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("Cancelled by user")
+
     # ── Step 2: median smooth ─────────────────────────────────────────────────
     median_smoothed = out_dir / f"{run_id}_chain_median_smoothed.tif"
-    median_smooth(conf_filtered, median_smoothed, kernel_size=median_k)
+    bs_median = 256 if (drone_mode and pixel_res_m < 1.0) else DEFAULT_BLOCK
+    median_smooth(conf_filtered, median_smoothed, kernel_size=median_k,
+                  block_size=bs_median)
     results["median_smoothed"] = median_smoothed
     _audit.log_event(
         run_id, "gate",
         {"stage": "chain_median_smooth", "kernel_size": median_k,
-         "output": str(median_smoothed)},
+         "drone_mode": drone_mode, "output": str(median_smoothed)},
         decision="proceed",
     )
     if progress is not None:
         progress("median_smooth complete")
 
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("Cancelled by user")
+
     # ── Step 3: morphological close (repeated morpho_iters times) ────────────
     morpho_input = median_smoothed
+    bs_morpho = 256 if (drone_mode and pixel_res_m < 1.0) else DEFAULT_BLOCK
     for i in range(max(1, morpho_iters)):
         morpho_out = out_dir / f"{run_id}_chain_morpho_{i}.tif"
-        morphological_close(morpho_input, morpho_out, kernel_size=morpho_k)
+        morphological_close(morpho_input, morpho_out, kernel_size=morpho_k,
+                            block_size=bs_morpho)
         morpho_input = morpho_out
     results["morphologically_closed"] = morpho_input
     _audit.log_event(
         run_id, "gate",
         {"stage": "chain_morphological_close",
          "kernel_size": morpho_k, "iterations": morpho_iters,
-         "output": str(morpho_input)},
+         "drone_mode": drone_mode, "output": str(morpho_input)},
         decision="proceed",
     )
     if progress is not None:
         progress("morphological_close complete")
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("Cancelled by user")
 
     # ── Step 4: sieve filter ──────────────────────────────────────────────────
     sieved_out = out_dir / f"{run_id}_chain_sieved.tif"

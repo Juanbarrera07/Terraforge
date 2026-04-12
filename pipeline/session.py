@@ -52,6 +52,12 @@ _DEFAULTS: dict[str, Any] = {
     "training_source":      None,   # str  — "label_raster" | "shapefile"
     "training_path":        None,   # str  — path to shapefile or label raster
     "class_column":         None,   # str  — class column name (shapefile only)
+    # ── Post-processing chain async state ────────────────────────────────────
+    "chain_thread":         None,   # threading.Thread | None
+    "chain_queue":          None,   # queue.Queue | None
+    "chain_log":            None,   # list[str] — accumulated progress messages
+    "chain_start_time":     None,   # float — time.time() at chain start
+    "chain_cancel_event":   None,   # threading.Event | None
 }
 
 
@@ -136,6 +142,11 @@ def new_run() -> str:
     st.session_state.training_source      = None
     st.session_state.training_path        = None
     st.session_state.class_column         = None
+    st.session_state.chain_thread         = None
+    st.session_state.chain_queue          = None
+    st.session_state.chain_log            = None
+    st.session_state.chain_start_time     = None
+    st.session_state.chain_cancel_event   = None
 
     # Clean previous run's tmp — best-effort, never blocks the new run.
     if old_run_id and cfg:

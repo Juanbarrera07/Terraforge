@@ -22,6 +22,7 @@ The only data held in Python are:
 """
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -176,53 +177,102 @@ def render() -> None:
 
     if st.button("▶ Build COG + STAC + Audit Log", type="primary",
                  key="run_export_build"):
-        build_errors: list[str] = []
+        build_errors:  list[str] = []
+        step_times:    list[float] = []
+        build_log:     list[str] = []
+
+        _build_steps = [
+            ("COG",       "Cloud Optimized GeoTIFF"),
+            ("STAC",      "STAC item JSON"),
+            ("Audit log", "Audit log export"),
+        ]
+        _n_build = len(_build_steps)
+
+        prog_bar = st.progress(0, text="Starting export…")
+
+        def _build_log_entry(msg: str) -> None:
+            ts = datetime.now().strftime("%H:%M:%S")
+            build_log.append(f"[{ts}] {msg}")
 
         # Step 1 — write COG
-        with st.spinner("Converting to Cloud Optimized GeoTIFF…"):
-            try:
-                write_cog(
-                    src_path  = classified_path,
-                    out_path  = cog_path,
-                    resampling = "nearest",   # classification raster
-                )
-                st.success(f"COG written → `{cog_path.name}`", icon="✅")
-            except Exception as exc:
-                build_errors.append(f"COG: {exc}")
-                st.error(f"COG failed: {exc}", icon="❌")
+        _t0 = time.time()
+        prog_bar.progress(0 / _n_build, text="Step 1/3: Converting to COG…")
+        try:
+            write_cog(
+                src_path   = classified_path,
+                out_path   = cog_path,
+                resampling = "nearest",
+            )
+            _dt = time.time() - _t0
+            step_times.append(_dt)
+            _build_log_entry(f"✅ COG written → {cog_path.name} ({_dt:.1f}s)")
+        except Exception as exc:
+            build_errors.append(f"COG: {exc}")
+            _build_log_entry(f"❌ COG failed: {exc}")
+            step_times.append(0.0)
+        prog_bar.progress(1 / _n_build)
 
-        # Step 2 — build + write STAC item (no pixel I/O)
+        # Step 2 — build + write STAC item
+        _t0 = time.time()
+        prog_bar.progress(1 / _n_build, text="Step 2/3: Generating STAC item…")
         if cog_path.exists():
-            with st.spinner("Generating STAC item JSON…"):
-                try:
-                    item = build_stac_item(
-                        cog_path   = cog_path,
-                        run_id     = run_id,
-                        properties = extra_props or None,
-                    )
-                    write_stac_item(item, stac_path)
-                    # Release the dict — it was only needed for serialisation
-                    del item
-                    st.success(f"STAC item written → `{stac_path.name}`", icon="✅")
-                except Exception as exc:
-                    build_errors.append(f"STAC: {exc}")
-                    st.error(f"STAC item failed: {exc}", icon="❌")
-
-        # Step 3 — export audit log (reads from logs/ via audit.get_log)
-        with st.spinner("Exporting audit log…"):
             try:
-                export_audit_log(run_id, audit_log_path)
-                st.success(
-                    f"Audit log exported → `{audit_log_path.name}`", icon="✅"
+                item = build_stac_item(
+                    cog_path   = cog_path,
+                    run_id     = run_id,
+                    properties = extra_props or None,
                 )
+                write_stac_item(item, stac_path)
+                del item
+                _dt = time.time() - _t0
+                step_times.append(_dt)
+                _build_log_entry(f"✅ STAC item written → {stac_path.name} ({_dt:.1f}s)")
             except Exception as exc:
-                build_errors.append(f"Audit log: {exc}")
-                st.error(f"Audit log export failed: {exc}", icon="❌")
+                build_errors.append(f"STAC: {exc}")
+                _build_log_entry(f"❌ STAC failed: {exc}")
+                step_times.append(0.0)
+        else:
+            build_errors.append("STAC skipped — COG not produced")
+            _build_log_entry("⚠️ STAC skipped — COG not produced")
+            step_times.append(0.0)
+        prog_bar.progress(2 / _n_build)
+
+        # Step 3 — export audit log
+        _t0 = time.time()
+        prog_bar.progress(2 / _n_build, text="Step 3/3: Exporting audit log…")
+        try:
+            export_audit_log(run_id, audit_log_path)
+            _dt = time.time() - _t0
+            step_times.append(_dt)
+            _build_log_entry(
+                f"✅ Audit log exported → {audit_log_path.name} ({_dt:.1f}s)"
+            )
+        except Exception as exc:
+            build_errors.append(f"Audit log: {exc}")
+            _build_log_entry(f"❌ Audit log failed: {exc}")
+            step_times.append(0.0)
+        prog_bar.progress(1.0, text="Export build complete.")
+
+        # Result summary — check marks per step
+        st.markdown("---")
+        for i, (sname, slabel) in enumerate(_build_steps):
+            ok  = not any(sname in e for e in build_errors)
+            ico = "✅" if ok else "❌"
+            dt  = step_times[i] if i < len(step_times) else 0.0
+            st.markdown(f"{ico} **Step {i+1}/3: {slabel}** — {dt:.1f}s")
+
+        with st.expander("📋 Build log", expanded=bool(build_errors)):
+            st.code("\n".join(build_log), language=None)
 
         if build_errors:
             audit.log_event(
                 run_id, "error",
                 {"stage": "export_build", "errors": build_errors},
+            )
+        else:
+            _total_dt = sum(step_times)
+            st.success(
+                f"All 3 steps complete — Total: {_total_dt:.1f}s", icon="✅"
             )
 
     # ── C: PDF Report ─────────────────────────────────────────────────────
@@ -323,7 +373,8 @@ def render() -> None:
         )
 
         if st.button("📦 Package ZIP", key="run_package"):
-            with st.spinner("Computing checksums and packaging…"):
+            _n_files = len(candidate_artifacts)
+            with st.spinner(f"Computing checksums… ({_n_files} files)"):
                 try:
                     manifest = package_run(
                         run_id    = run_id,
@@ -350,6 +401,17 @@ def render() -> None:
                         f"ZIP packaged → `{manifest.zip_path.name}`",
                         icon="✅",
                     )
+                    # Inline file table with truncated checksums
+                    _pkg_rows = [
+                        {
+                            "File":          fname,
+                            "Size (KB)":     round(manifest.file_sizes.get(fname, 0) / 1024, 1),
+                            "SHA-256 (16 chars)": checksum[:16],
+                        }
+                        for fname, checksum in manifest.file_checksums.items()
+                    ]
+                    st.dataframe(pd.DataFrame(_pkg_rows),
+                                 use_container_width=True, hide_index=True)
                 except Exception as exc:
                     st.error(f"Packaging failed: {exc}", icon="❌")
                     audit.log_event(

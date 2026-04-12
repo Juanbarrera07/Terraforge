@@ -23,6 +23,11 @@ _DEFAULTS: dict[str, Any] = {
     "drift_alert_pct": 20,
     # Post-processing
     "min_mapping_unit_ha": 0.5,
+    # Drone mode overrides
+    "drone_pixel_res_threshold_m": 1.0,
+    "drone_median_kernel_max": 7,
+    "drone_morpho_iterations": 2,
+    "drone_sieve_min_px": 100,
     # Training
     "default_k_folds": 5,
     "smote_auto_threshold_pct": 10,

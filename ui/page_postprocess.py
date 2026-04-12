@@ -14,6 +14,10 @@ session["accuracy"]            : AccuracyResult  — from reference CSV
 from __future__ import annotations
 
 import math
+import queue
+import threading
+import time
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -32,6 +36,7 @@ from pipeline.postprocess import (
     check_drift,
     compute_class_areas,
     confidence_filter,
+    estimate_chain_time,
     has_gate_failures,
     median_smooth,
     morphological_close,
@@ -41,6 +46,14 @@ from pipeline.postprocess import (
 )
 from pipeline.raster_io import get_meta, iter_windows
 from ui._helpers import gate_metric, run_output_dir, save_upload
+
+# Step names and display labels for the chain
+_CHAIN_STEPS: list[tuple[str, str]] = [
+    ("confidence_filter",    "Confidence filter"),
+    ("median_smooth",        "Median smooth"),
+    ("morphological_close",  "Morphological close"),
+    ("sieve_filter",         "Sieve MMU filter"),
+]
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -292,61 +305,260 @@ def render() -> None:
 
         chain_out_dir = run_output_dir(cfg, run_id, "postprocessing")
 
-        if st.button("▶ Run Post-Processing Chain", key="run_chain",
-                     type="primary"):
+        # ── Chain configuration panel ─────────────────────────────────────
+        with st.expander("⚙️ Chain Configuration", expanded=False):
+            st.caption("Parameters are read from `pipeline_config.yaml`.")
+            _cfg_params = {
+                "confidence_threshold":     cfg.get("confidence_threshold", 0.6),
+                "median_filter_size":       cfg.get("median_filter_size", 3),
+                "morphological_kernel_size":cfg.get("morphological_kernel_size", 3),
+                "morphological_iterations": cfg.get("morphological_iterations", 1),
+                "min_mapping_unit_ha":      cfg.get("min_mapping_unit_ha", 0.5),
+            }
+            drone_threshold = float(cfg.get("drone_pixel_res_threshold_m", 1.0))
+            is_drone = pixel_res_m is not None and pixel_res_m < drone_threshold
+
+            _param_rows = [{"Parameter": k, "Value": str(v)}
+                           for k, v in _cfg_params.items()]
+            st.dataframe(pd.DataFrame(_param_rows),
+                         use_container_width=True, hide_index=True)
+
+            if is_drone:
+                st.info(
+                    f"**Drone mode** will be auto-enabled "
+                    f"(pixel_res_m = {pixel_res_m:.3f} m < {drone_threshold} m). "
+                    "Parameters will be adapted for high-resolution imagery.",
+                    icon="🛸",
+                )
+            else:
+                st.caption(
+                    f"pixel_res_m = {pixel_res_m:.2f} m — "
+                    f"standard mode (drone mode threshold: {drone_threshold} m)"
+                )
+
+            # Time estimate table
             try:
-                steps = [
-                    "confidence_filter",
-                    "median_smooth",
-                    "morphological_close",
-                    "sieve_filter",
+                _res_for_est = pixel_res_m if pixel_res_m else 10.0
+                _estimates   = estimate_chain_time(classified_path, cfg, _res_for_est)
+                _warn_msg    = _estimates.pop("warning", None)
+                _est_rows = [
+                    {"Step": _CHAIN_STEPS[i][1],
+                     "Estimated time": f"~{_estimates[k]:.0f}s"}
+                    for i, (k, _) in enumerate(_CHAIN_STEPS)
+                    if k in _estimates
                 ]
-                prog_bar = st.progress(0, text="Starting chain…")
+                _total_s = sum(_estimates.values())
+                _est_rows.append({"Step": "**TOTAL**",
+                                  "Estimated time": f"**~{_total_s/60:.1f} min**"})
+                st.markdown("**Estimated processing time**")
+                st.dataframe(pd.DataFrame(_est_rows),
+                             use_container_width=True, hide_index=True)
+                if _warn_msg:
+                    st.warning(f"⏱️ {_warn_msg}", icon="⏱️")
+            except Exception:
+                pass  # estimates are best-effort
 
-                def _progress(msg: str) -> None:
-                    step_idx = next(
-                        (i + 1 for i, s in enumerate(steps) if s in msg),
-                        len(steps),
+        # ── Thread state helpers ──────────────────────────────────────────
+        _chain_thread: threading.Thread | None = session.get("chain_thread")
+        _chain_queue:  queue.Queue | None      = session.get("chain_queue")
+        _chain_running = _chain_thread is not None and _chain_thread.is_alive()
+
+        # ── Launch button (only if not running) ───────────────────────────
+        if not _chain_running:
+            if st.button("▶ Run Post-Processing Chain", key="run_chain",
+                         type="primary"):
+                _q  = queue.Queue()
+                _ev = threading.Event()
+
+                def _run_chain_in_thread(
+                    classified_path=classified_path,
+                    confidence_path=confidence_path,
+                    cfg=cfg,
+                    out_dir=chain_out_dir,
+                    run_id=run_id,
+                    q=_q,
+                    cancel_event=_ev,
+                ) -> None:
+                    """Execute chain in background thread; communicate via queue."""
+                    _step_names  = [s for s, _ in _CHAIN_STEPS]
+                    _current_step = [0]  # mutable via closure
+
+                    def _progress(msg: str) -> None:
+                        step_idx = next(
+                            (i + 1 for i, s in enumerate(_step_names) if s in msg),
+                            _current_step[0] + 1,
+                        )
+                        _current_step[0] = step_idx
+                        ts = datetime.now().strftime("%H:%M:%S")
+                        q.put({
+                            "step":  step_idx,
+                            "total": len(_step_names),
+                            "msg":   msg,
+                            "done":  False,
+                            "error": None,
+                            "log":   f"[{ts}] Step {step_idx}/{len(_step_names)}: {msg}",
+                        })
+
+                    try:
+                        result = run_postprocess_chain(
+                            classified_path = classified_path,
+                            confidence_path = confidence_path,
+                            cfg             = cfg,
+                            out_dir         = out_dir,
+                            run_id          = run_id,
+                            progress        = _progress,
+                            cancel_event    = cancel_event,
+                        )
+                        ts = datetime.now().strftime("%H:%M:%S")
+                        q.put({
+                            "step":   len(_step_names),
+                            "total":  len(_step_names),
+                            "msg":    "Chain complete",
+                            "done":   True,
+                            "error":  None,
+                            "result": result,
+                            "log":    f"[{ts}] Chain complete — {result['final'].name}",
+                        })
+                    except Exception as exc:  # noqa: BLE001
+                        ts = datetime.now().strftime("%H:%M:%S")
+                        q.put({
+                            "step":  0,
+                            "total": len(_step_names),
+                            "msg":   str(exc),
+                            "done":  True,
+                            "error": str(exc),
+                            "log":   f"[{ts}] ERROR: {exc}",
+                        })
+
+                _t = threading.Thread(target=_run_chain_in_thread, daemon=True)
+                session.set_("chain_thread",       _t)
+                session.set_("chain_queue",        _q)
+                session.set_("chain_cancel_event", _ev)
+                session.set_("chain_log",          [])
+                session.set_("chain_start_time",   time.time())
+                _t.start()
+                st.rerun()
+
+        # ── Polling loop (runs while thread is alive) ─────────────────────
+        _chain_thread = session.get("chain_thread")
+        _chain_queue  = session.get("chain_queue")
+        _chain_running = _chain_thread is not None and _chain_thread.is_alive()
+
+        if _chain_running or (
+            _chain_thread is not None
+            and not _chain_thread.is_alive()
+            and _chain_queue is not None
+            and not _chain_queue.empty()
+        ):
+            _start_t  = session.get("chain_start_time") or time.time()
+            _elapsed  = time.time() - _start_t
+            _log_msgs: list[str] = session.get("chain_log") or []
+            _last_step  = 0
+            _last_total = len(_CHAIN_STEPS)
+            _done_msg   = None
+
+            # Drain the queue
+            while True:
+                try:
+                    _msg = _chain_queue.get_nowait()
+                    _log_msgs.append(_msg["log"])
+                    _last_step  = _msg["step"]
+                    _last_total = _msg["total"]
+                    if _msg["done"]:
+                        _done_msg = _msg
+                        break
+                except queue.Empty:
+                    break
+
+            session.set_("chain_log", _log_msgs)
+
+            # Render status panel
+            _frac = min(1.0, _last_step / _last_total) if _last_total else 0.0
+            _step_label = (
+                _CHAIN_STEPS[_last_step - 1][1]
+                if 0 < _last_step <= len(_CHAIN_STEPS)
+                else "Starting…"
+            )
+            col_prog, col_time = st.columns([3, 1])
+            with col_prog:
+                st.progress(_frac,
+                            text=f"Step {_last_step}/{_last_total}: {_step_label}")
+            with col_time:
+                st.metric("Elapsed", f"{_elapsed:.0f}s")
+
+            # Step checklist
+            for i, (_, slabel) in enumerate(_CHAIN_STEPS):
+                if i < _last_step:
+                    icon = "✅"
+                elif i == _last_step:
+                    icon = "🔄"
+                else:
+                    icon = "⏳"
+                st.markdown(f"{icon} **{i+1}. {slabel}**")
+
+            # Log expander
+            with st.expander("📋 Processing Log", expanded=_chain_running):
+                log_text = "\n".join(_log_msgs) if _log_msgs else "Waiting for first step…"
+                st.code(log_text, language=None)
+
+            # Cancel button
+            _cancel_ev = session.get("chain_cancel_event")
+            if _chain_running and _cancel_ev is not None:
+                if st.button("⏹ Cancel", key="cancel_chain"):
+                    _cancel_ev.set()
+                    session.set_("chain_log",
+                                 _log_msgs + ["[user] Cancellation requested…"])
+
+            # Handle completion
+            if _done_msg is not None:
+                session.set_("chain_thread",       None)
+                session.set_("chain_queue",        None)
+                session.set_("chain_cancel_event", None)
+
+                if _done_msg["error"]:
+                    err = _done_msg["error"]
+                    if "Cancelled" in err:
+                        st.warning("Chain cancelled by user.", icon="⏹")
+                    else:
+                        st.error(f"Post-processing chain failed: {err}", icon="❌")
+                        audit.log_event(
+                            run_id, "error",
+                            {"stage": "postprocess_chain", "error": err},
+                        )
+                else:
+                    chain_result = _done_msg["result"]
+                    final_path   = chain_result["final"]
+                    total_elapsed = time.time() - _start_t
+                    session.set_("classified",    str(final_path))
+                    session.set_("_chain_result", chain_result)
+                    working_path = final_path
+                    audit.log_event(
+                        run_id, "decision",
+                        {"action": "run_postprocess_chain",
+                         "final_output": str(final_path),
+                         "elapsed_s": round(total_elapsed, 1)},
+                        decision="proceed",
                     )
-                    prog_bar.progress(
-                        step_idx / len(steps),
-                        text=f"Step {step_idx}/{len(steps)}: {msg}",
+
+                    # Result summary
+                    st.markdown("---")
+                    for i, (_, slabel) in enumerate(_CHAIN_STEPS):
+                        st.markdown(f"✅ Step {i+1}/4: {slabel}")
+                    st.markdown("─" * 40)
+                    try:
+                        _sz_mb = final_path.stat().st_size / (1024 * 1024)
+                        _sz_str = f" ({_sz_mb:.1f} MB)"
+                    except Exception:
+                        _sz_str = ""
+                    st.success(
+                        f"Chain complete — Total: {total_elapsed:.1f}s\n\n"
+                        f"Output: `{final_path.name}`{_sz_str}",
+                        icon="✅",
                     )
 
-                with st.spinner("Running post-processing chain…"):
-                    chain_result = run_postprocess_chain(
-                        classified_path = classified_path,
-                        confidence_path = confidence_path,
-                        cfg             = cfg,
-                        out_dir         = chain_out_dir,
-                        run_id          = run_id,
-                        progress        = _progress,
-                    )
-                prog_bar.progress(1.0, text="Chain complete.")
-
-                final_path = chain_result["final"]
-                session.set_("classified",    str(final_path))
-                session.set_("_chain_result", chain_result)
-                working_path = final_path
-
-                audit.log_event(
-                    run_id, "decision",
-                    {"action": "run_postprocess_chain",
-                     "final_output": str(final_path)},
-                    decision="proceed",
-                )
-                st.success(
-                    f"Chain complete → `{final_path.name}`", icon="✅"
-                )
-
-            except RuntimeError as exc:
-                st.error(str(exc), icon="❌")
-            except Exception as exc:
-                st.error(f"Post-processing chain failed: {exc}", icon="❌")
-                audit.log_event(
-                    run_id, "error",
-                    {"stage": "postprocess_chain", "error": str(exc)},
-                )
+            elif _chain_running:
+                time.sleep(0.5)
+                st.rerun()
 
         # ── Before / after comparison ─────────────────────────────────────
         chain_result_stored = session.get("_chain_result")

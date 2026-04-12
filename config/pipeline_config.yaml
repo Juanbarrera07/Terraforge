@@ -33,6 +33,12 @@ morphological_kernel_size: 3       # structuring element size for morphological 
 morphological_iterations: 1        # number of morphological closing passes
 sieve_connectivity: 4              # pixel connectivity for GDAL sieve filter (4 or 8)
 
+# ── Drone imagery overrides ──────────────────────────────────────────────────
+drone_pixel_res_threshold_m: 1.0   # below this → drone_mode auto-enabled
+drone_median_kernel_max: 7          # cap median kernel in drone mode
+drone_morpho_iterations: 2          # more passes, smaller kernel
+drone_sieve_min_px: 100             # minimum pixels for MMU in drone mode
+
 # ── ML Training ──────────────────────────────────────────────────────────────
 default_k_folds: 5
 smote_auto_threshold_pct: 10       # any class < 10% total → auto-suggest SMOTE

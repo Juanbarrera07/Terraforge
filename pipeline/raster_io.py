@@ -28,7 +28,8 @@ import rasterio
 import rasterio.enums
 from rasterio.windows import Window
 
-DEFAULT_BLOCK: int = 512  # tile side in pixels
+DEFAULT_BLOCK: int = 512   # tile side in pixels
+DRONE_BLOCK:   int = 256   # smaller tiles for drone rasters (less RAM per tile)
 
 
 # ── Metadata ─────────────────────────────────────────────────────────────────
@@ -85,7 +86,12 @@ def iter_windows(
     """
     Yield non-overlapping tile windows that cover the full dataset extent.
     Windows at the edges are clipped to the dataset boundary.
+
+    For rasters with more than 100 million pixels the block_size is
+    automatically capped at 512 to limit per-tile RAM usage.
     """
+    if ds.width * ds.height > 100_000_000:
+        block_size = min(block_size, 512)
     for row_off in range(0, ds.height, block_size):
         row_h = min(block_size, ds.height - row_off)
         for col_off in range(0, ds.width, block_size):
