@@ -27,14 +27,18 @@ from ui._helpers import gate_metric, make_progress_cb, run_output_dir
 # ── Feature metadata ──────────────────────────────────────────────────────────
 
 _FEATURE_LABELS: dict[str, str] = {
-    "ndvi":      "NDVI — Normalised Difference Vegetation Index (NIR, Red)",
-    "ndwi":      "NDWI — Normalised Difference Water Index (Green, NIR)",
-    "bsi":       "BSI  — Bare Soil Index (SWIR, Red, NIR, Blue)",
-    "ndre":      "NDRE — Normalised Difference Red-Edge (RedEdge, Red)",
-    "vari":      "VARI — Visible Atmospherically Resistant Index (Green, Red, Blue)",
-    "sar_ratio": "SAR Ratio — VV / VH backscatter ratio",
-    "slope":     "Slope — terrain gradient from DEM",
-    "aspect":    "Aspect — terrain aspect from DEM",
+    "ndvi":             "NDVI — Normalised Difference Vegetation Index (NIR, Red)",
+    "ndwi":             "NDWI — Normalised Difference Water Index (Green, NIR)",
+    "bsi":              "BSI  — Bare Soil Index (SWIR, Red, NIR, Blue)",
+    "ndre":             "NDRE — Normalised Difference Red-Edge (RedEdge, Red)",
+    "vari":             "VARI — Visible Atmospherically Resistant Index (Green, Red, Blue)",
+    "sar_ratio":        "SAR Ratio — VV / VH backscatter ratio",
+    "slope":            "Slope — terrain gradient from DEM",
+    "aspect":           "Aspect — terrain aspect from DEM",
+    # GLCM spatial texture (written as bands in the feature stack)
+    "glcm_contrast":    "GLCM Contrast — texture roughness",
+    "glcm_homogeneity": "GLCM Homogeneity — texture uniformity",
+    "glcm_correlation": "GLCM Correlation — texture linear dependency",
 }
 
 _BAND_FIELDS: list[tuple[str, str]] = [
@@ -105,10 +109,18 @@ def _band_map_ui(n_bands: int) -> BandMap:
 def _feature_toggle_ui(available: list[str]) -> list[str]:
     """
     Render per-feature enable/disable checkboxes.
+
+    Spectral/terrain features each have their own checkbox.
+    GLCM texture features are grouped behind a single "Include GLCM texture"
+    checkbox (default True when any GLCM feature is available).
+
     Returns the list of enabled feature names.
     """
     if not available:
         return []
+
+    spectral_avail = [f for f in available if not f.startswith("glcm_")]
+    glcm_avail     = [f for f in available if f.startswith("glcm_")]
 
     st.markdown("**Feature selection** — enable or disable individual features.")
     st.caption(
@@ -117,10 +129,25 @@ def _feature_toggle_ui(available: list[str]) -> list[str]:
     )
 
     enabled: list[str] = []
-    for name in available:
+    for name in spectral_avail:
         label = _FEATURE_LABELS.get(name, name)
         if st.checkbox(label, value=True, key=f"feat_en_{name}"):
             enabled.append(name)
+
+    if glcm_avail:
+        st.markdown("**GLCM texture features** (computed on NIR / best optical band)")
+        include_glcm = st.checkbox(
+            "Include GLCM texture — contrast, homogeneity, correlation",
+            value=True,
+            key="feat_en_glcm_group",
+            help=(
+                "Adds three texture bands to the feature stack.  "
+                "Computed per tile using skimage graycomatrix; "
+                "averaged across 0°, 45°, 90°, 135° for rotation invariance."
+            ),
+        )
+        if include_glcm:
+            enabled.extend(glcm_avail)
 
     return enabled
 

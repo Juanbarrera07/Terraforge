@@ -10,11 +10,17 @@ Public API
 ClassAreaResult  — per-class pixel counts and areas in hectares
 DriftResult      — per-class area change vs previous run
 AccuracyResult   — accuracy metrics + point-count bookkeeping
-compute_class_areas     — windowed per-class pixel tally
-sieve_filter            — MMU enforcement via GDAL SieveFilter (see warning)
-morphological_close     — windowed morphological closing via overlap-padded tiles
+QualityGateResult           — single 3-tier gate result (pass/warning/fail)
+compute_class_areas         — windowed per-class pixel tally
+sieve_filter                — MMU enforcement via GDAL SieveFilter (see warning)
+morphological_close         — windowed morphological closing via overlap-padded tiles
 assess_accuracy_from_points — accuracy from a reference CSV with lat/lon
-check_drift             — class-area drift between two runs
+check_drift                 — class-area drift between two runs
+confidence_filter           — replace low-confidence pixels with local median (windowed)
+median_smooth               — windowed median filter via scipy.ndimage
+run_postprocess_chain       — 4-step chain: confidence_filter→median_smooth→morpho→sieve
+run_quality_gates           — evaluate OA/Kappa/F1/confidence/nodata against 3-tier gates
+has_gate_failures           — True if any gate result has status "fail"
 
 Design rules
 ------------
@@ -22,8 +28,8 @@ Design rules
 - All raster reads through iter_windows except where documented otherwise.
 - sieve_filter is a deliberate exception: GDAL SieveFilter loads the full
   raster band into GDAL-managed memory.  See that function's docstring.
-- morphological_close uses overlap-padded windowed reads to avoid full-raster
-  allocation in Python.
+- morphological_close and confidence_filter use overlap-padded windowed reads
+  to avoid full-raster allocation in Python.
 - AccuracyResult records total/valid/discarded point counts with reason codes.
 """
 from __future__ import annotations
@@ -51,6 +57,7 @@ try:
 except ImportError:          # pragma: no cover
     _PYPROJ_AVAILABLE = False
 
+from pipeline import audit as _audit
 from pipeline.config_loader import load_config
 from pipeline.raster_io import DEFAULT_BLOCK, iter_windows
 
@@ -529,6 +536,527 @@ def check_drift(
         flagged_classes = sorted(flagged),
         drift_alert_pct = drift_alert_pct,
     )
+
+
+def confidence_filter(
+    classified_path: str | Path,
+    confidence_path: str | Path,
+    threshold:       float,
+    out_path:        str | Path,
+    block_size:      int = DEFAULT_BLOCK,
+) -> Path:
+    """
+    Replace low-confidence pixels with the median of their classified neighbourhood.
+
+    Pixels where confidence < ``threshold`` (and confidence is not nodata) are
+    replaced with the result of a 5×5 scipy median filter applied to the
+    classified raster.  Processing uses overlap-padded windowed reads so
+    tile-boundary pixels receive correct neighbourhood values.  Nodata pixels
+    in the classified raster are never modified.
+
+    Parameters
+    ----------
+    classified_path : Source classified raster (single band, integer dtype).
+    confidence_path : Companion confidence raster (float32, same extent/CRS).
+                      Nodata sentinel is expected to be -9999.0.
+    threshold       : Pixels with confidence strictly below this value are replaced.
+    out_path        : Destination path for the filtered raster.
+    block_size      : Tile side length for windowed processing.
+
+    Returns
+    -------
+    Path of the written output raster.
+    """
+    from scipy.ndimage import median_filter as _ndimage_median  # noqa: PLC0415
+
+    _CONF_FILTER_SIZE = 5
+    pad = _CONF_FILTER_SIZE // 2
+
+    classified_path = Path(classified_path)
+    confidence_path = Path(confidence_path)
+    out_path        = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with rasterio.open(classified_path) as cls_src:
+        nodata_val = int(cls_src.nodata) if cls_src.nodata is not None else -1
+        profile    = cls_src.profile.copy()
+        height     = cls_src.height
+        width      = cls_src.width
+
+    profile.update(
+        driver    = "GTiff",
+        compress  = "deflate",
+        predictor = 2,
+        tiled     = True,
+        blockxsize = block_size,
+        blockysize = block_size,
+    )
+
+    with (
+        rasterio.open(classified_path) as cls_src,
+        rasterio.open(confidence_path) as conf_src,
+        rasterio.open(out_path, "w", **profile) as dst,
+    ):
+        for win in iter_windows(cls_src, block_size):
+            col_off = win.col_off
+            row_off = win.row_off
+            win_w   = win.width
+            win_h   = win.height
+
+            # Padded window — clipped to raster bounds
+            p_col_off = max(0, col_off - pad)
+            p_row_off = max(0, row_off - pad)
+            p_col_end = min(width,  col_off + win_w + pad)
+            p_row_end = min(height, row_off + win_h + pad)
+            p_win = rasterio.windows.Window(
+                col_off = p_col_off,
+                row_off = p_row_off,
+                width   = p_col_end - p_col_off,
+                height  = p_row_end - p_row_off,
+            )
+
+            padded_cls  = cls_src.read(1, window=p_win).astype(np.int32)
+            padded_conf = conf_src.read(1, window=p_win).astype(np.float32)
+
+            # Compute 5×5 median of classified values for potential replacements
+            padded_median = _ndimage_median(padded_cls, size=_CONF_FILTER_SIZE)
+
+            # Replace: confidence is valid (>= 0) AND below threshold AND not nodata
+            replace = (
+                (padded_conf >= 0.0) &
+                (padded_conf < threshold) &
+                (padded_cls != nodata_val)
+            )
+            padded_result = np.where(replace, padded_median, padded_cls)
+
+            # Trim back to the original (unpadded) window
+            r_start = row_off - p_row_off
+            c_start = col_off - p_col_off
+            result  = padded_result[r_start:r_start + win_h, c_start:c_start + win_w]
+
+            dst.write(result.astype(profile["dtype"]), 1, window=win)
+
+    return out_path
+
+
+def median_smooth(
+    src_path:    str | Path,
+    out_path:    str | Path,
+    kernel_size: int = 3,
+    block_size:  int = DEFAULT_BLOCK,
+) -> Path:
+    """
+    Smooth a classified raster using a windowed median filter.
+
+    Processing uses overlap-padded windowed reads so tile-boundary pixels
+    receive correct neighbourhood values.  Nodata pixels are preserved.
+
+    Parameters
+    ----------
+    src_path    : Source classified raster (single band, integer dtype).
+    out_path    : Destination path for the smoothed raster.
+    kernel_size : Side length of the square median-filter kernel.
+                  Must be a positive odd integer ≥ 3.
+    block_size  : Tile side length for windowed processing.
+
+    Returns
+    -------
+    Path of the written output raster.
+
+    Raises
+    ------
+    ValueError
+        If kernel_size is not a positive odd integer.
+    """
+    from scipy.ndimage import median_filter as _ndimage_median  # noqa: PLC0415
+
+    if not isinstance(kernel_size, int) or kernel_size < 3 or kernel_size % 2 == 0:
+        raise ValueError(
+            f"kernel_size must be a positive odd integer >= 3, got {kernel_size!r}."
+        )
+
+    src_path = Path(src_path)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pad = kernel_size // 2
+
+    with rasterio.open(src_path) as src:
+        nodata_val = int(src.nodata) if src.nodata is not None else -1
+        profile    = src.profile.copy()
+        height     = src.height
+        width      = src.width
+
+    profile.update(
+        driver     = "GTiff",
+        compress   = "deflate",
+        predictor  = 2,
+        tiled      = True,
+        blockxsize = block_size,
+        blockysize = block_size,
+    )
+
+    with (
+        rasterio.open(src_path) as src,
+        rasterio.open(out_path, "w", **profile) as dst,
+    ):
+        for win in iter_windows(src, block_size):
+            col_off = win.col_off
+            row_off = win.row_off
+            win_w   = win.width
+            win_h   = win.height
+
+            p_col_off = max(0, col_off - pad)
+            p_row_off = max(0, row_off - pad)
+            p_col_end = min(width,  col_off + win_w + pad)
+            p_row_end = min(height, row_off + win_h + pad)
+            p_win = rasterio.windows.Window(
+                col_off = p_col_off,
+                row_off = p_row_off,
+                width   = p_col_end - p_col_off,
+                height  = p_row_end - p_row_off,
+            )
+
+            padded      = src.read(1, window=p_win).astype(np.int32)
+            nodata_mask = padded == nodata_val
+
+            smoothed             = _ndimage_median(padded, size=kernel_size)
+            smoothed[nodata_mask] = nodata_val  # restore nodata pixels
+
+            r_start = row_off - p_row_off
+            c_start = col_off - p_col_off
+            result  = smoothed[r_start:r_start + win_h, c_start:c_start + win_w]
+
+            dst.write(result.astype(profile["dtype"]), 1, window=win)
+
+    return out_path
+
+
+def run_postprocess_chain(
+    classified_path: str | Path,
+    confidence_path: str | Path,
+    cfg:             dict,
+    out_dir:         str | Path,
+    run_id:          str,
+    progress:        Optional[Any] = None,
+) -> dict:
+    """
+    Run the 4-step post-classification filtering chain.
+
+    Steps
+    -----
+    1. ``confidence_filter``   — Replace low-confidence pixels with local median.
+    2. ``median_smooth``       — Windowed median filter to reduce isolated pixels.
+    3. ``morphological_close`` — Majority-vote morphological closing
+                                 (repeated ``morphological_iterations`` times).
+    4. ``sieve_filter``        — MMU enforcement via GDAL SieveFilter.
+
+    Each step is logged to the audit trail via ``audit.log_event``.
+
+    Parameters
+    ----------
+    classified_path : Input classified raster (int16, single band).
+    confidence_path : Companion confidence raster produced by predict_raster.
+    cfg             : Pipeline config dict.  Keys used:
+                      ``confidence_threshold``, ``median_filter_size``,
+                      ``morphological_kernel_size``, ``morphological_iterations``,
+                      ``min_mapping_unit_ha``, ``sieve_connectivity``.
+    out_dir         : Directory for intermediate and final outputs.
+    run_id          : Active run identifier for audit logging.
+    progress        : Optional callable(msg: str) invoked after each step.
+
+    Returns
+    -------
+    dict with keys:
+        ``"confidence_filtered"``    — Path, output of step 1
+        ``"median_smoothed"``        — Path, output of step 2
+        ``"morphologically_closed"`` — Path, output of step 3
+        ``"final"``                  — Path, output of step 4 (sieve)
+
+    Raises
+    ------
+    RuntimeError : If GDAL is not available (required for sieve step).
+    ValueError   : If the raster has a non-projected CRS (pixel_res_m cannot
+                   be derived automatically).
+    """
+    if not _GDAL_AVAILABLE:
+        raise RuntimeError(
+            "GDAL (osgeo) is required for the full post-processing chain "
+            "(sieve_filter step)."
+        )
+
+    classified_path = Path(classified_path)
+    confidence_path = Path(confidence_path)
+    out_dir         = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    conf_threshold = float(cfg.get("confidence_threshold",    0.6))
+    median_k       = int(cfg.get("median_filter_size",         3))
+    morpho_k       = int(cfg.get("morphological_kernel_size",  3))
+    morpho_iters   = int(cfg.get("morphological_iterations",   1))
+    mmu_ha         = float(cfg.get("min_mapping_unit_ha",      0.5))
+    connectivity   = int(cfg.get("sieve_connectivity",         4))
+
+    with rasterio.open(classified_path) as ds:
+        if ds.crs and ds.crs.is_projected:
+            pixel_res_m = float(abs(ds.transform.a))
+        else:
+            raise ValueError(
+                "Cannot derive pixel_res_m for a non-projected CRS. "
+                "Reproject the classified raster to a projected CRS first."
+            )
+
+    results: dict = {}
+
+    # ── Step 1: confidence filter ─────────────────────────────────────────────
+    conf_filtered = out_dir / f"{run_id}_chain_conf_filtered.tif"
+    confidence_filter(classified_path, confidence_path, conf_threshold, conf_filtered)
+    results["confidence_filtered"] = conf_filtered
+    _audit.log_event(
+        run_id, "gate",
+        {"stage": "chain_confidence_filter", "threshold": conf_threshold,
+         "output": str(conf_filtered)},
+        decision="proceed",
+    )
+    if progress is not None:
+        progress("confidence_filter complete")
+
+    # ── Step 2: median smooth ─────────────────────────────────────────────────
+    median_smoothed = out_dir / f"{run_id}_chain_median_smoothed.tif"
+    median_smooth(conf_filtered, median_smoothed, kernel_size=median_k)
+    results["median_smoothed"] = median_smoothed
+    _audit.log_event(
+        run_id, "gate",
+        {"stage": "chain_median_smooth", "kernel_size": median_k,
+         "output": str(median_smoothed)},
+        decision="proceed",
+    )
+    if progress is not None:
+        progress("median_smooth complete")
+
+    # ── Step 3: morphological close (repeated morpho_iters times) ────────────
+    morpho_input = median_smoothed
+    for i in range(max(1, morpho_iters)):
+        morpho_out = out_dir / f"{run_id}_chain_morpho_{i}.tif"
+        morphological_close(morpho_input, morpho_out, kernel_size=morpho_k)
+        morpho_input = morpho_out
+    results["morphologically_closed"] = morpho_input
+    _audit.log_event(
+        run_id, "gate",
+        {"stage": "chain_morphological_close",
+         "kernel_size": morpho_k, "iterations": morpho_iters,
+         "output": str(morpho_input)},
+        decision="proceed",
+    )
+    if progress is not None:
+        progress("morphological_close complete")
+
+    # ── Step 4: sieve filter ──────────────────────────────────────────────────
+    sieved_out = out_dir / f"{run_id}_chain_sieved.tif"
+    sieve_filter(
+        morpho_input, sieved_out,
+        mmu_ha       = mmu_ha,
+        pixel_res_m  = pixel_res_m,
+        connectivity = connectivity,
+    )
+    results["final"] = sieved_out
+    _audit.log_event(
+        run_id, "gate",
+        {"stage": "chain_sieve_filter",
+         "mmu_ha": mmu_ha, "pixel_res_m": pixel_res_m,
+         "connectivity": connectivity,
+         "output": str(sieved_out)},
+        decision="proceed",
+    )
+    if progress is not None:
+        progress("sieve_filter complete")
+
+    return results
+
+
+# ── 3-tier quality gate ───────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class QualityGateResult:
+    """
+    Result of a single 3-tier quality gate evaluation.
+
+    Attributes
+    ----------
+    metric_name    : Human-readable name of the metric evaluated.
+    value          : Measured value.
+    status         : "pass" | "warning" | "fail"
+    threshold_pass : Value required for PASS (meaning depends on higher_is_better).
+    threshold_fail : Value that triggers FAIL.
+    message        : Human-readable explanation of the gate outcome.
+    """
+    metric_name:    str
+    value:          float
+    status:         str    # "pass" | "warning" | "fail"
+    threshold_pass: float
+    threshold_fail: float
+    message:        str
+
+
+def _eval_gate(
+    metric_name:      str,
+    value:            float,
+    threshold_pass:   float,
+    threshold_fail:   float,
+    higher_is_better: bool = True,
+) -> QualityGateResult:
+    """
+    Evaluate ``value`` against pass/warning/fail thresholds.
+
+    For higher-is-better metrics (OA, Kappa, F1, confidence):
+        pass    ← value >= threshold_pass
+        warning ← threshold_fail <= value < threshold_pass
+        fail    ← value < threshold_fail
+
+    For lower-is-better metrics (nodata coverage fraction):
+        pass    ← value <= threshold_pass
+        warning ← threshold_pass < value <= threshold_fail
+        fail    ← value > threshold_fail
+    """
+    if higher_is_better:
+        if value >= threshold_pass:
+            status  = "pass"
+            message = f"{metric_name}: {value:.4f} ≥ {threshold_pass:.4f} (PASS)"
+        elif value >= threshold_fail:
+            status  = "warning"
+            message = (
+                f"{metric_name}: {value:.4f} below pass threshold "
+                f"({threshold_pass:.4f}) — above fail threshold "
+                f"({threshold_fail:.4f}) (WARNING)"
+            )
+        else:
+            status  = "fail"
+            message = (
+                f"{metric_name}: {value:.4f} < {threshold_fail:.4f} (FAIL)"
+            )
+    else:
+        if value <= threshold_pass:
+            status  = "pass"
+            message = f"{metric_name}: {value:.2%} ≤ {threshold_pass:.2%} (PASS)"
+        elif value <= threshold_fail:
+            status  = "warning"
+            message = (
+                f"{metric_name}: {value:.2%} exceeds pass threshold "
+                f"({threshold_pass:.2%}) (WARNING)"
+            )
+        else:
+            status  = "fail"
+            message = (
+                f"{metric_name}: {value:.2%} > {threshold_fail:.2%} (FAIL)"
+            )
+
+    return QualityGateResult(
+        metric_name    = metric_name,
+        value          = value,
+        status         = status,
+        threshold_pass = threshold_pass,
+        threshold_fail = threshold_fail,
+        message        = message,
+    )
+
+
+def run_quality_gates(
+    model_result,
+    accuracy_result,
+    class_areas,
+    confidence_stats,
+    cfg:        dict,
+    nodata_pct: Optional[float] = None,
+) -> list[QualityGateResult]:
+    """
+    Evaluate classification quality across 3-tier PASS / WARNING / FAIL gates.
+
+    All thresholds are read from ``cfg``; no hardcoded values.
+
+    Parameters
+    ----------
+    model_result     : ClassificationResult (OA, kappa, minority_f1 attributes).
+    accuracy_result  : AccuracyResult or None (independent accuracy assessment).
+    class_areas      : ClassAreaResult or None (used for context only; nodata
+                       fraction is passed separately via ``nodata_pct``).
+    confidence_stats : dict with at least a ``"mean"`` key, or None.
+    cfg              : Pipeline config dict.
+    nodata_pct       : Fraction of raster pixels that are nodata [0, 1], or None
+                       to skip the nodata coverage gate.
+
+    Returns
+    -------
+    list[QualityGateResult] — one entry per gate evaluated.  The order is:
+    OA (training), Kappa, Minority F1, OA (independent), Mean Confidence,
+    Nodata Coverage.  Gates are skipped (not appended) when the required input
+    is None.
+    """
+    results: list[QualityGateResult] = []
+
+    # ── Read thresholds from cfg ───────────────────────────────────────────────
+    oa_pass    = float(cfg.get("quality_gate_oa_pass",          0.90))
+    oa_fail    = float(cfg.get("quality_gate_oa_fail",          0.80))
+    kappa_pass = float(cfg.get("quality_gate_kappa_pass",       0.80))
+    kappa_fail = float(cfg.get("quality_gate_kappa_fail",       0.65))
+    f1_pass    = float(cfg.get("quality_gate_f1_pass",          0.70))
+    f1_fail    = float(cfg.get("quality_gate_f1_fail",          0.50))
+    conf_pass  = float(cfg.get("quality_gate_confidence_pass",  0.75))
+    conf_fail  = float(cfg.get("quality_gate_confidence_fail",  0.60))
+    nd_pass    = float(cfg.get("quality_gate_nodata_pass",       0.05))
+    nd_fail    = float(cfg.get("quality_gate_nodata_fail",       0.10))
+
+    # ── 1. Overall Accuracy (training model) ──────────────────────────────────
+    if model_result is not None:
+        oa = getattr(model_result, "oa", None)
+        if oa is not None:
+            results.append(_eval_gate(
+                "Overall Accuracy (training)", float(oa), oa_pass, oa_fail
+            ))
+
+    # ── 2. Cohen's Kappa (training model) ─────────────────────────────────────
+    if model_result is not None:
+        kappa = getattr(model_result, "kappa", None)
+        if kappa is not None:
+            results.append(_eval_gate(
+                "Cohen's Kappa", float(kappa), kappa_pass, kappa_fail
+            ))
+
+    # ── 3. Minority F1 (training model) ───────────────────────────────────────
+    if model_result is not None:
+        f1 = getattr(model_result, "minority_f1", None)
+        if f1 is not None:
+            results.append(_eval_gate(
+                "Minority F1", float(f1), f1_pass, f1_fail
+            ))
+
+    # ── 4. Overall Accuracy (independent accuracy assessment, if run) ──────────
+    if accuracy_result is not None:
+        ind_oa = getattr(accuracy_result, "oa", None)
+        if ind_oa is not None:
+            results.append(_eval_gate(
+                "Overall Accuracy (independent)", float(ind_oa), oa_pass, oa_fail
+            ))
+
+    # ── 5. Mean confidence ────────────────────────────────────────────────────
+    if confidence_stats is not None:
+        mean_conf = confidence_stats.get("mean")
+        if mean_conf is not None:
+            results.append(_eval_gate(
+                "Mean Confidence", float(mean_conf), conf_pass, conf_fail
+            ))
+
+    # ── 6. Nodata coverage ────────────────────────────────────────────────────
+    if nodata_pct is not None:
+        results.append(_eval_gate(
+            "Nodata Coverage", float(nodata_pct), nd_pass, nd_fail,
+            higher_is_better=False,
+        ))
+
+    return results
+
+
+def has_gate_failures(results: list[QualityGateResult]) -> bool:
+    """Return True if any gate in ``results`` has status ``"fail"``."""
+    return any(r.status == "fail" for r in results)
 
 
 # ── Private helpers ───────────────────────────────────────────────────────────

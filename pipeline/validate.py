@@ -15,6 +15,7 @@ Critical checks (hard-block on failure)
 ----------------------------------------
 - crs_match
 - minimum_overlap
+- shapefile_alignment (CRS missing, overlap < 50%, < 2 classes)
 """
 from __future__ import annotations
 
@@ -388,6 +389,107 @@ def check_label_alignment(
         f"(CRS: {feat_crs_key}, res: {feat_res:.4f}, "
         f"origin offset: {dist:.4f} units).",
         detail={"distance": round(dist, 6), "feat_res": feat_res},
+    )
+
+
+def check_shapefile_alignment(
+    shp_meta:     dict,
+    feature_meta: dict,
+) -> ValidationResult:
+    """
+    Validate that a shapefile is usable as training data for the feature stack.
+
+    Three sub-checks are performed in order; the first failure short-circuits:
+
+    1. **CRS availability** — both the shapefile and the feature stack must have
+       a valid CRS so that reprojection to a common system is possible.
+    2. **Bounding-box overlap** — the shapefile extent (in the feature CRS) must
+       overlap at least 50 % of the feature raster's extent.
+    3. **Class count** — at least 2 unique classes must be present in the
+       shapefile's class column.
+
+    ``shp_meta`` is constructed by ``training.build_shapefile_meta`` and contains:
+
+    * ``"crs"``          — original CRS of the shapefile (``rasterio.crs.CRS`` or None)
+    * ``"bounds"``       — ``rasterio.coords.BoundingBox`` in the feature CRS
+    * ``"class_labels"`` — sorted list of unique integer class labels
+
+    Parameters
+    ----------
+    shp_meta     : Shapefile metadata dict (from ``training.build_shapefile_meta``).
+    feature_meta : Feature stack metadata dict (from ``raster_io.get_meta``).
+
+    Returns
+    -------
+    ValidationResult with ``is_critical=True`` on any failure.
+    """
+    check = "shapefile_alignment"
+
+    shp_crs_key  = _crs_key(shp_meta.get("crs"))
+    feat_crs_key = _crs_key(feature_meta.get("crs"))
+
+    # ── 1. CRS availability ───────────────────────────────────────────────────
+    if shp_crs_key is None:
+        return ValidationResult(
+            check, "error",
+            "Shapefile has no CRS.  Assign a coordinate reference system "
+            "before using it for training.",
+            is_critical=True,
+            detail={"shp_crs": None, "feature_crs": feat_crs_key},
+        )
+    if feat_crs_key is None:
+        return ValidationResult(
+            check, "error",
+            "Feature stack has no CRS.  Cannot determine reprojection target.",
+            is_critical=True,
+            detail={"shp_crs": shp_crs_key, "feature_crs": None},
+        )
+
+    # ── 2. Bounding-box overlap (shp bounds already in feature CRS) ───────────
+    shp_bounds  = shp_meta.get("bounds")
+    feat_bounds = feature_meta.get("bounds")
+
+    if shp_bounds is None or feat_bounds is None:
+        return ValidationResult(
+            check, "error",
+            "Cannot compute spatial overlap: missing bounds in metadata.",
+            is_critical=True,
+        )
+
+    overlap = compute_overlap_pct(shp_bounds, feat_bounds)
+    if overlap < 50.0:
+        return ValidationResult(
+            check, "error",
+            f"Shapefile extent overlaps only {overlap:.1f}% of the feature raster "
+            f"(minimum: 50%).  Verify that the shapefile covers the study area.",
+            is_critical=True,
+            detail={"overlap_pct": round(overlap, 2)},
+        )
+
+    # ── 3. Class count ────────────────────────────────────────────────────────
+    class_labels = shp_meta.get("class_labels", [])
+    n_classes    = len(class_labels)
+    if n_classes < 2:
+        return ValidationResult(
+            check, "error",
+            f"Only {n_classes} unique class(es) found in the shapefile.  "
+            "At least 2 classes are required for supervised classification.",
+            is_critical=True,
+            detail={"n_classes": n_classes, "class_labels": class_labels},
+        )
+
+    return ValidationResult(
+        check, "ok",
+        f"Shapefile is aligned with the feature stack "
+        f"(overlap: {overlap:.1f}%, CRS: {shp_crs_key} → {feat_crs_key}, "
+        f"{n_classes} classes: {class_labels}).",
+        detail={
+            "overlap_pct":  round(overlap, 2),
+            "shp_crs":      shp_crs_key,
+            "feature_crs":  feat_crs_key,
+            "n_classes":    n_classes,
+            "class_labels": class_labels,
+        },
     )
 
 

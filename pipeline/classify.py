@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import warnings
 from collections import Counter
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -583,12 +584,13 @@ def train_model(
 
 
 def predict_raster(
-    model:         Any,
-    feature_path:  str | Path,
-    out_path:      str | Path,
-    feature_names: list[str],
-    block_size:    int = DEFAULT_BLOCK,
-    nodata:        int = -1,
+    model:           Any,
+    feature_path:    str | Path,
+    out_path:        str | Path,
+    feature_names:   list[str],
+    block_size:      int = DEFAULT_BLOCK,
+    nodata:          int = -1,
+    confidence_path: str | Path | None = None,
 ) -> Path:
     """
     Apply a trained classifier to a feature stack raster, tile by tile.
@@ -597,16 +599,25 @@ def predict_raster(
     Pixels where any feature band is nodata or non-finite are written as
     ``nodata`` in the output without calling the model.
 
+    When ``confidence_path`` is set a companion float32 raster is written
+    alongside the classified output.  Each valid pixel receives the maximum
+    class probability returned by ``model.predict_proba()``; nodata pixels
+    receive -9999.0.
+
     Parameters
     ----------
-    model         : Trained sklearn / XGBoost estimator.
-    feature_path  : Feature stack GeoTIFF (from features.compute_features).
-    out_path      : Output classified raster path.
-    feature_names : Feature names in band order — must match the order used
-                    during training (used for metadata only; not reordered here).
-    block_size    : Tile side length for windowed processing.
-    nodata        : Output nodata sentinel.  Must not equal any valid class label.
-                    Written as int16; default -1.
+    model           : Trained sklearn / XGBoost estimator.
+    feature_path    : Feature stack GeoTIFF (from features.compute_features).
+    out_path        : Output classified raster path.
+    feature_names   : Feature names in band order — must match the order used
+                      during training (used for metadata only; not reordered here).
+    block_size      : Tile side length for windowed processing.
+    nodata          : Output nodata sentinel.  Must not equal any valid class label.
+                      Written as int16; default -1.
+    confidence_path : Optional path for the companion confidence raster (float32,
+                      single band, deflate).  Values are max-class probabilities
+                      in [0, 1]; nodata pixels get -9999.0.  If None, no
+                      confidence raster is written.
 
     Returns
     -------
@@ -632,10 +643,27 @@ def predict_raster(
         "blockysize": block_size,
     })
 
-    with (
-        rasterio.open(feature_path) as src,
-        rasterio.open(out_path, "w", **out_profile) as dst,
-    ):
+    # Build confidence raster profile (float32, same spatial metadata)
+    conf_profile = None
+    if confidence_path is not None:
+        confidence_path = Path(confidence_path)
+        confidence_path.parent.mkdir(parents=True, exist_ok=True)
+        conf_profile = out_profile.copy()
+        conf_profile.update({
+            "dtype":  "float32",
+            "nodata": -9999.0,
+        })
+        conf_profile.pop("predictor", None)   # predictor=2 is for integers only
+
+    with ExitStack() as stack:
+        src      = stack.enter_context(rasterio.open(feature_path))
+        dst      = stack.enter_context(rasterio.open(out_path, "w", **out_profile))
+        conf_dst = None
+        if conf_profile is not None:
+            conf_dst = stack.enter_context(
+                rasterio.open(confidence_path, "w", **conf_profile)
+            )
+
         for window in iter_windows(src, block_size):
             tile = src.read(window=window).astype(np.float32)   # (n_feat, H, W)
             H, W = tile.shape[1], tile.shape[2]
@@ -648,6 +676,8 @@ def predict_raster(
                     valid &= tile[b] != feat_nodata
 
             out_tile = np.full((H, W), nodata, dtype=np.int16)
+            if conf_dst is not None:
+                conf_tile = np.full((H, W), -9999.0, dtype=np.float32)
 
             if valid.any():
                 # tile[:, valid] → (n_feat, n_valid)
@@ -657,6 +687,12 @@ def predict_raster(
                 preds    = model.predict(X_valid).astype(np.int16)
                 out_tile[valid] = preds
 
+                if conf_dst is not None:
+                    proba = model.predict_proba(X_valid)   # (n_valid, n_classes)
+                    conf_tile[valid] = np.max(proba, axis=1).astype(np.float32)
+
             dst.write(out_tile[np.newaxis], window=window)
+            if conf_dst is not None:
+                conf_dst.write(conf_tile[np.newaxis], window=window)
 
     return out_path

@@ -37,6 +37,7 @@ from pipeline.export import (
     write_cog,
     write_stac_item,
 )
+from pipeline.postprocess import has_gate_failures
 from pipeline.report import generate_report
 from ui._helpers import run_output_dir
 
@@ -89,6 +90,16 @@ def render() -> None:
     cfg     = session.get("config")
     out_dir = run_output_dir(cfg, run_id, "export")
 
+    # ── Quality gate status banner ─────────────────────────────────────────
+    _gate_results = session.get("quality_gate_results")
+    if _gate_results is not None and has_gate_failures(_gate_results):
+        st.warning(
+            "⚠️ **Quality gate failures were overridden.** "
+            "The exported product may not meet accuracy standards. "
+            "See the audit log for details.",
+            icon="⚠️",
+        )
+
     st.caption(
         f"Source raster: `{classified_path.name}`  |  "
         f"Output directory: `{out_dir}`"
@@ -140,6 +151,20 @@ def render() -> None:
         extra_props["terraforge:accuracy_oa"]    = round(acc_result.oa, 4)
         extra_props["terraforge:accuracy_kappa"] = round(acc_result.kappa, 4)
         extra_props["terraforge:n_ref_points"]   = acc_result.n_valid
+
+    if _gate_results is not None:
+        _gate_status = (
+            "fail"    if has_gate_failures(_gate_results)
+            else "warning" if any(r.status == "warning" for r in _gate_results)
+            else "pass"
+        )
+        extra_props["terraforge:gate_status"] = _gate_status
+        extra_props["terraforge:gate_results"] = [
+            {"metric": r.metric_name,
+             "value":  round(r.value, 4),
+             "status": r.status}
+            for r in _gate_results
+        ]
 
     # ── B: Build artifacts ────────────────────────────────────────────────
     st.divider()
@@ -202,29 +227,41 @@ def render() -> None:
 
     # ── C: PDF Report ─────────────────────────────────────────────────────
     st.divider()
-    st.subheader("C — Reporte PDF Técnico")
+    st.subheader("C — Technical PDF Report")
     st.caption(
-        "Genera un reporte técnico corporativo en PDF con métricas de clasificación, "
-        "preprocesamiento y log de auditoría completo."
+        "Generates a corporate technical PDF with classification metrics, "
+        "post-processing parameters, quality gate results, and the full audit log."
     )
 
     pdf_path = out_dir / f"{run_id}_report.pdf"
     operator_name = st.text_input(
-        "Nombre del operador",
-        placeholder="Ej. Juan García — Geólogo Senior",
+        "Operator name",
+        placeholder="e.g. Jane Smith — Senior Geologist",
         key="export_operator_name",
-        help="Se incluye en la portada del reporte. Puede dejarse en blanco.",
+        help="Included on the report cover page. May be left blank.",
     )
 
-    if st.button("📄 Generar Reporte PDF", key="run_pdf_report"):
-        with st.spinner("Generando reporte PDF…"):
+    if st.button("📄 Generate PDF Report", key="run_pdf_report"):
+        with st.spinner("Generating PDF report…"):
             try:
                 # Build a snapshot of session data — primitives and dataclasses only
+                confidence_path_str = session.get("confidence")
+                confidence_stats = None
+                if confidence_path_str and Path(confidence_path_str).exists():
+                    from pipeline.report import compute_confidence_stats
+                    cfg_snap = session.get("config") or {}
+                    threshold = float(cfg_snap.get("confidence_threshold", 0.6))
+                    confidence_stats = compute_confidence_stats(
+                        Path(confidence_path_str), threshold
+                    )
+
                 session_snapshot = {
-                    "model":    session.get("model"),
-                    "accuracy": session.get("accuracy"),
-                    "areas":    session.get("areas"),
-                    "config":   session.get("config"),
+                    "model":             session.get("model"),
+                    "accuracy":          session.get("accuracy"),
+                    "class_areas":       session.get("class_areas"),
+                    "config":            session.get("config"),
+                    "confidence_stats":  confidence_stats,
+                    "postprocess_chain": session.get("_chain_result"),
                 }
                 generate_report(
                     run_id        = run_id,
@@ -232,7 +269,7 @@ def render() -> None:
                     out_path      = pdf_path,
                     operator_name = operator_name.strip(),
                 )
-                st.success(f"Reporte generado → `{pdf_path.name}`", icon="✅")
+                st.success(f"Report generated → `{pdf_path.name}`", icon="✅")
                 audit.log_event(
                     run_id, "gate",
                     {
@@ -243,7 +280,7 @@ def render() -> None:
                     decision="proceed",
                 )
             except Exception as exc:
-                st.error(f"Error generando el reporte: {exc}", icon="❌")
+                st.error(f"Report generation failed: {exc}", icon="❌")
                 audit.log_event(
                     run_id, "error",
                     {"stage": "report_generation", "error": str(exc)},
@@ -251,7 +288,7 @@ def render() -> None:
 
     if pdf_path.exists():
         st.download_button(
-            label     = f"⬇️  Descargar `{pdf_path.name}`",
+            label     = f"⬇️  Download `{pdf_path.name}`",
             data      = pdf_path.read_bytes(),
             file_name = pdf_path.name,
             mime      = "application/pdf",

@@ -9,11 +9,18 @@ via a pure-NumPy tile-level approach and returned as an aggregated summary in
 FeatureResult.texture_summary.  They are NOT written into the feature raster;
 the output GeoTIFF contains only spatially-continuous per-pixel features.
 
+In addition, spatial GLCM texture features (glcm_contrast, glcm_homogeneity,
+glcm_correlation) are written as full bands in the feature raster when optical
+bands are present.  These are computed per tile using skimage.feature.graycomatrix
++ graycoprops with overlap padding (window_size // 2) and averaged across all
+configured angles for rotation invariance.
+
 Public API
 ----------
-BandMap          — maps logical band names to 1-indexed band positions
-FeatureResult    — frozen dataclass returned by compute_features()
-compute_features — main entry point
+BandMap               — maps logical band names to 1-indexed band positions
+FeatureResult         — frozen dataclass returned by compute_features()
+compute_features      — main entry point
+compute_glcm_features — standalone spatial GLCM map computation
 
 Design rules (consistent with preprocess.py)
 --------------------------------------------
@@ -23,6 +30,8 @@ Design rules (consistent with preprocess.py)
 - Output nodata is always a finite float (never NaN in the file).
 - Internal calculations use NaN for invalid pixels; NaN is restored to
   file_nodata before every write.
+- GLCM tiles use boundless reads (rasterio boundless=True) to pad edges
+  without loading extra file data.
 """
 from __future__ import annotations
 
@@ -33,6 +42,7 @@ from typing import Callable, Optional
 
 import numpy as np
 import rasterio
+from rasterio.windows import Window
 
 from pipeline.config_loader import load_config
 from pipeline.raster_io import DEFAULT_BLOCK, iter_windows
@@ -240,7 +250,20 @@ def _active_features(band_map: BandMap) -> list[str]:
     if bm.vv      and bm.vh:                            feats.append("sar_ratio")
     if bm.dem:                                          feats.append("slope")
     if bm.dem:                                          feats.append("aspect")
+    # Spatial GLCM texture features — require at least one optical band
+    if bm.nir or bm.red or bm.green or bm.blue:
+        feats.extend(["glcm_contrast", "glcm_homogeneity", "glcm_correlation"])
     return feats
+
+
+def _glcm_band_idx(band_map: BandMap) -> Optional[int]:
+    """
+    Return the 1-indexed band to use for GLCM computation.
+
+    Priority: NIR → Red → Green → Blue.
+    Returns None only when no optical band is mapped.
+    """
+    return band_map.nir or band_map.red or band_map.green or band_map.blue
 
 
 def _count_windows(ds: rasterio.DatasetReader, block_size: int) -> int:
@@ -346,6 +369,118 @@ def _select_glcm_band(
     return band
 
 
+# ── skimage-based GLCM (spatial maps) ────────────────────────────────────────
+
+_GLCM_PROPS = ("contrast", "homogeneity", "correlation")
+_GLCM_ANGLES_DEFAULT = [0.0, math.pi / 4, math.pi / 2, 3 * math.pi / 4]
+_GLCM_DISTANCES_DEFAULT = [1]
+
+
+def _read_padded_band(
+    src:        rasterio.DatasetReader,
+    window:     Window,
+    band_idx:   int,
+    pad:        int,
+    src_nodata: Optional[float],
+) -> Optional[np.ndarray]:
+    """
+    Read a 2D tile for *band_idx* (1-indexed) padded by *pad* pixels on all sides.
+
+    Uses ``boundless=True`` so edge tiles are zero-padded by rasterio rather
+    than requiring a separate clamping pass.  Out-of-bounds pixels and nodata
+    pixels are replaced with the tile mean so they do not skew the GLCM
+    histogram.
+
+    Returns None when every pixel in the padded tile is nodata/non-finite.
+    """
+    fill = float(src_nodata) if src_nodata is not None else 0.0
+    padded_win = Window(
+        col_off=window.col_off - pad,
+        row_off=window.row_off - pad,
+        width=window.width   + 2 * pad,
+        height=window.height + 2 * pad,
+    )
+    data = src.read(
+        band_idx,
+        window=padded_win,
+        boundless=True,
+        fill_value=fill,
+    ).astype(np.float64)
+
+    if src_nodata is not None:
+        data[data == src_nodata] = np.nan
+
+    finite = np.isfinite(data)
+    if not finite.any():
+        return None
+
+    data[~finite] = float(data[finite].mean())
+    return data
+
+
+def _tile_glcm_skimage(
+    band_2d:   np.ndarray,
+    distances: list[int],
+    angles:    list[float],
+    levels:    int,
+) -> dict[str, float]:
+    """
+    Compute GLCM texture scalars for a 2D tile using skimage.
+
+    Algorithm
+    ---------
+    1. Quantise *band_2d* to [0, levels−1] unsigned integers.
+    2. Build the (levels × levels × n_distances × n_angles) GLCM via
+       ``skimage.feature.graycomatrix`` (symmetric=True, normed=True).
+    3. Average across distances and angles for rotation invariance.
+    4. Derive contrast, homogeneity, correlation via graycoprops.
+    5. Compute entropy manually: −Σ P·log₂(P + ε).
+
+    Returns a dict with keys ``contrast``, ``homogeneity``, ``correlation``,
+    ``entropy``.  A uniform tile returns contrast=0, homogeneity=1,
+    correlation=0, entropy=0 immediately.
+    """
+    try:
+        from skimage.feature import graycomatrix, graycoprops
+    except ImportError as exc:
+        raise ImportError(
+            "scikit-image is required for GLCM spatial features.  "
+            "Install with: micromamba install -c conda-forge scikit-image"
+        ) from exc
+
+    vmin = float(band_2d.min())
+    vmax = float(band_2d.max())
+
+    if not (np.isfinite(vmin) and np.isfinite(vmax)) or vmax <= vmin:
+        return {"contrast": 0.0, "homogeneity": 1.0, "correlation": 0.0, "entropy": 0.0}
+
+    q = np.clip(
+        ((band_2d - vmin) / (vmax - vmin) * (levels - 1)).astype(np.uint8),
+        0, levels - 1,
+    )
+
+    # glcm: (levels, levels, n_distances, n_angles)
+    glcm = graycomatrix(
+        q,
+        distances=distances,
+        angles=angles,
+        levels=levels,
+        symmetric=True,
+        normed=True,
+    )
+
+    result: dict[str, float] = {}
+    for prop in _GLCM_PROPS:
+        vals = graycoprops(glcm, prop)   # (n_distances, n_angles)
+        result[prop] = float(vals.mean())
+
+    # Entropy (not in graycoprops): average GLCM across distances & angles first
+    P = glcm.mean(axis=(2, 3))           # (levels, levels)
+    result["entropy"] = float(-np.sum(P * np.log2(P + 1e-12)))
+
+    return result
+
+
 # ── Streaming correlation (Pass 2) ────────────────────────────────────────────
 
 def _streaming_correlation(
@@ -408,6 +543,119 @@ def _streaming_correlation(
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
+
+def compute_glcm_features(
+    src_path:   str | Path,
+    band_index: int,
+    out_paths:  dict[str, str | Path],
+    distances:  list[int]   = _GLCM_DISTANCES_DEFAULT,
+    angles:     list[float] = _GLCM_ANGLES_DEFAULT,
+    levels:     int         = 32,
+    window_size: int        = 7,
+    block_size: int         = DEFAULT_BLOCK,
+    progress:   ProgressCallback = None,
+) -> dict[str, Path]:
+    """
+    Write spatial GLCM texture maps for the requested properties.
+
+    For each tile (read with overlap padding ``window_size // 2`` on all sides)
+    one GLCM is computed for the whole padded tile and the resulting scalar is
+    written to every pixel in the corresponding output tile.  This gives a
+    block-resolution texture map — one value per ``block_size × block_size``
+    region — which is fast and well-suited as a classification input.
+
+    Parameters
+    ----------
+    src_path    : Source raster (any dtype; one band will be read).
+    band_index  : 1-indexed band to use for GLCM computation.
+    out_paths   : Mapping of property name → output GeoTIFF path.
+                  Supported keys: ``"contrast"``, ``"homogeneity"``,
+                  ``"correlation"``, ``"entropy"``.  Only properties present
+                  as keys are computed and written.
+    distances   : Co-occurrence distances (pixels).
+    angles      : Co-occurrence angles (radians).  Averaged for rotation
+                  invariance.
+    levels      : Number of grey-level quantisation bins (32 is a good default
+                  for balanced discrimination vs. computation time).
+    window_size : Overlap padding = ``window_size // 2``.  A larger value gives
+                  each tile more border context.
+    block_size  : I/O tile side in pixels.
+    progress    : Optional callback(current_tile, total_tiles).
+
+    Returns
+    -------
+    dict mapping each property name that was written to its output ``Path``.
+
+    Raises
+    ------
+    ImportError : If scikit-image is not installed.
+    ValueError  : If *band_index* is out of range for *src_path*.
+    """
+    src_path = Path(src_path)
+    resolved: dict[str, Path] = {k: Path(v) for k, v in out_paths.items()}
+    for p in resolved.values():
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+    pad = window_size // 2
+
+    with rasterio.open(src_path) as src:
+        if band_index < 1 or band_index > src.count:
+            raise ValueError(
+                f"band_index={band_index} out of range for raster with "
+                f"{src.count} band(s)."
+            )
+        src_nodata  = src.nodata
+        src_profile = src.profile.copy()
+        n_tiles     = _count_windows(src, block_size)
+
+    out_profile = src_profile.copy()
+    out_profile.update({
+        "count":      1,
+        "dtype":      "float32",
+        "nodata":     -9999.0,
+        "compress":   "deflate",
+        "predictor":  3,
+        "tiled":      True,
+        "blockxsize": block_size,
+        "blockysize": block_size,
+    })
+
+    # Open all output files simultaneously
+    from contextlib import ExitStack
+    writers: dict[str, rasterio.DatasetWriter] = {}
+
+    with ExitStack() as stack, rasterio.open(src_path) as src:
+        for prop, path in resolved.items():
+            writers[prop] = stack.enter_context(rasterio.open(path, "w", **out_profile))
+
+        tile_num = 0
+        for window in iter_windows(src, block_size):
+            band_2d = _read_padded_band(
+                src, window, band_index, pad, src_nodata
+            )
+
+            if band_2d is not None:
+                glcm_vals = _tile_glcm_skimage(band_2d, distances, angles, levels)
+            else:
+                glcm_vals = {p: np.nan for p in ("contrast", "homogeneity",
+                                                  "correlation", "entropy")}
+
+            H, W = window.height, window.width
+            for prop, writer in writers.items():
+                scalar = glcm_vals.get(prop, np.nan)
+                out_tile = np.full(
+                    (1, H, W),
+                    -9999.0 if not np.isfinite(scalar) else scalar,
+                    dtype=np.float32,
+                )
+                writer.write(out_tile, window=window)
+
+            tile_num += 1
+            if progress is not None:
+                progress(tile_num, n_tiles)
+
+    return resolved
+
 
 def active_features(band_map: BandMap) -> list[str]:
     """
@@ -496,6 +744,14 @@ def compute_features(
         )
     n_features = len(active_feats)
 
+    # Split active features into spectral/terrain and spatial GLCM groups
+    spectral_feats = [f for f in active_feats if not f.startswith("glcm_")]
+    glcm_feats     = [f for f in active_feats if f.startswith("glcm_")]
+    glcm_bidx      = _glcm_band_idx(band_map) if glcm_feats else None
+    glcm_window    = int(cfg.get("glcm_window_size", 7))
+    glcm_levels    = int(cfg.get("glcm_levels", 32))
+    glcm_pad       = glcm_window // 2
+
     with rasterio.open(src_path) as ds:
         src_profile = ds.profile.copy()
         src_nodata  = ds.nodata
@@ -541,11 +797,55 @@ def compute_features(
             H, W = raw.shape[1], raw.shape[2]
             total_pixels += H * W
 
-            feat_tile = _compute_tile_features(
-                raw, band_map, res, active_feats, src_nodata
+            # ── Spectral / terrain features ───────────────────────────────
+            spectral_tile = _compute_tile_features(
+                raw, band_map, res, spectral_feats, src_nodata
             )
 
-            # Accumulate per-feature statistics from valid (finite) pixels
+            # ── Spatial GLCM features (skimage, overlap-padded read) ──────
+            if glcm_feats and glcm_bidx is not None:
+                padded_band = _read_padded_band(
+                    src, window, glcm_bidx, glcm_pad, src_nodata
+                )
+                if padded_band is not None:
+                    glcm_vals = _tile_glcm_skimage(
+                        padded_band,
+                        _GLCM_DISTANCES_DEFAULT,
+                        _GLCM_ANGLES_DEFAULT,
+                        glcm_levels,
+                    )
+                else:
+                    glcm_vals = {p: np.nan for p in ("contrast", "homogeneity",
+                                                      "correlation", "entropy")}
+
+                glcm_tile = np.empty((len(glcm_feats), H, W), dtype=np.float64)
+                for gi, fname in enumerate(glcm_feats):
+                    prop = fname[5:]   # "glcm_contrast" → "contrast"
+                    scalar = glcm_vals.get(prop, np.nan)
+                    glcm_tile[gi] = scalar if np.isfinite(scalar) else np.nan
+
+                # Propagate source nodata: pixels nodata in the GLCM source band
+                # must be nodata in all GLCM output bands (same semantics as spectral).
+                src_band_raw = raw[glcm_bidx - 1]  # (H, W) float64
+                if src_nodata is not None:
+                    src_nd_mask = ~np.isfinite(src_band_raw) | (src_band_raw == src_nodata)
+                else:
+                    src_nd_mask = ~np.isfinite(src_band_raw)
+                for gi in range(len(glcm_feats)):
+                    glcm_tile[gi][src_nd_mask] = np.nan
+
+                feat_tile = np.concatenate([spectral_tile, glcm_tile], axis=0)
+            else:
+                feat_tile = spectral_tile
+
+            # ── Tile-level GLCM summary (pure-NumPy, goes to texture_summary)
+            glcm_band = _select_glcm_band(raw, band_map, src_nodata)
+            if glcm_band is not None:
+                tx = _glcm_features(glcm_band)
+                for k in glcm_lists:
+                    glcm_lists[k].append(tx[k])
+
+            # ── Accumulate per-feature statistics from valid pixels ────────
             for fi, fname in enumerate(active_feats):
                 fb    = feat_tile[fi]
                 valid = np.isfinite(fb)
@@ -558,14 +858,7 @@ def compute_features(
                     acc["sum2"]  += float((vals ** 2).sum())
                     acc["count"] += int(valid.sum())
 
-            # Tile-level GLCM on a representative band
-            glcm_band = _select_glcm_band(raw, band_map, src_nodata)
-            if glcm_band is not None:
-                tx = _glcm_features(glcm_band)
-                for k in glcm_lists:
-                    glcm_lists[k].append(tx[k])
-
-            # Replace internal NaN with file_nodata before writing
+            # ── Replace internal NaN with file_nodata before writing ───────
             out_tile = np.where(
                 np.isfinite(feat_tile), feat_tile, file_nodata
             ).astype(np.float32)

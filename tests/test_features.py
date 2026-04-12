@@ -26,8 +26,10 @@ from pipeline.features import (
     _sar_ratio,
     _select_glcm_band,
     _slope,
+    _tile_glcm_skimage,
     _vari,
     compute_features,
+    compute_glcm_features,
 )
 
 
@@ -277,7 +279,8 @@ def test_output_file_created(full_stack, full_band_map, tmp_path):
 def test_output_band_count_matches_feature_names(full_stack, full_band_map, tmp_path):
     out    = tmp_path / "features.tif"
     result = compute_features(full_stack, out, full_band_map)
-    assert len(result.feature_names) == 8  # all 8 features available
+    # 8 spectral/terrain + 3 GLCM spatial = 11 (optical bands nir+red present)
+    assert len(result.feature_names) == 11
     with rasterio.open(out) as ds:
         assert ds.count == len(result.feature_names)
 
@@ -465,9 +468,12 @@ def test_empty_bandmap_raises_value_error(make_raster, tmp_path):
 
 def test_active_features_ordering():
     """_active_features must return features in the canonical order."""
-    bm     = BandMap(blue=1, green=2, red=3, nir=4, swir=5, rededge=6, vv=7, vh=8, dem=9)
-    feats  = _active_features(bm)
-    assert feats == ["ndvi", "ndwi", "bsi", "ndre", "vari", "sar_ratio", "slope", "aspect"]
+    bm    = BandMap(blue=1, green=2, red=3, nir=4, swir=5, rededge=6, vv=7, vh=8, dem=9)
+    feats = _active_features(bm)
+    assert feats == [
+        "ndvi", "ndwi", "bsi", "ndre", "vari", "sar_ratio", "slope", "aspect",
+        "glcm_contrast", "glcm_homogeneity", "glcm_correlation",
+    ]
 
 
 def test_single_dem_band_produces_slope_and_aspect(make_raster, tmp_path):
@@ -477,3 +483,105 @@ def test_single_dem_band_produces_slope_and_aspect(make_raster, tmp_path):
     assert result.feature_names == ["slope", "aspect"]
     with rasterio.open(out) as ds:
         assert ds.count == 2
+
+
+# ── GLCM spatial features ─────────────────────────────────────────────────────
+
+def test_glcm_produces_valid_output(make_raster, tmp_path):
+    """
+    compute_glcm_features writes GeoTIFFs for every requested property.
+    All written pixels must be finite float32 values (or the file nodata -9999).
+    """
+    src = make_raster("optical.tif", bands=2, width=64, height=64,
+                      dtype="float32", nodata=-9999.0)
+    out_paths = {
+        "contrast":    tmp_path / "glcm_contrast.tif",
+        "homogeneity": tmp_path / "glcm_homogeneity.tif",
+        "correlation": tmp_path / "glcm_correlation.tif",
+        "entropy":     tmp_path / "glcm_entropy.tif",
+    }
+    result = compute_glcm_features(src, band_index=1, out_paths=out_paths,
+                                   block_size=32)
+
+    assert set(result.keys()) == set(out_paths.keys())
+    for prop, path in result.items():
+        assert path.exists(), f"Output missing for property '{prop}'"
+        with rasterio.open(path) as ds:
+            assert ds.count == 1
+            data = ds.read(1)
+            # Every pixel must be either the file nodata (-9999) or a finite value
+            assert np.all(np.isfinite(data) | (data == -9999.0)), (
+                f"Non-finite, non-nodata pixel found in '{prop}'"
+            )
+            # At least some pixels should be valid (not all nodata)
+            assert np.any(data != -9999.0), (
+                f"All pixels are nodata in '{prop}' — GLCM computation failed"
+            )
+
+
+def test_glcm_correct_band_count(make_raster, tmp_path):
+    """
+    compute_features with nir+red band map produces the expected number of bands:
+    ndvi (1) + glcm_contrast + glcm_homogeneity + glcm_correlation (3) = 4.
+    """
+    src = make_raster("nir_red.tif", bands=2, width=64, height=64,
+                      dtype="float32", nodata=-9999.0)
+    bm  = BandMap(nir=1, red=2)
+    out = tmp_path / "feat_glcm.tif"
+
+    result = compute_features(src, out, bm)
+
+    expected_names = ["ndvi", "glcm_contrast", "glcm_homogeneity", "glcm_correlation"]
+    assert result.feature_names == expected_names, (
+        f"Expected {expected_names}, got {result.feature_names}"
+    )
+    with rasterio.open(out) as ds:
+        assert ds.count == len(expected_names)
+
+
+def test_glcm_features_in_stats(make_raster, tmp_path):
+    """GLCM spatial features must appear in feature_stats with valid structure."""
+    src    = make_raster("opt2.tif", bands=2, dtype="float32")
+    result = compute_features(src, tmp_path / "f.tif", BandMap(nir=1, red=2))
+
+    for name in ("glcm_contrast", "glcm_homogeneity", "glcm_correlation"):
+        assert name in result.feature_stats, f"'{name}' missing from feature_stats"
+        assert set(result.feature_stats[name].keys()) == {
+            "min", "max", "mean", "std", "valid_pct"
+        }
+
+
+def test_glcm_excluded_by_enabled_features(make_raster, tmp_path):
+    """When glcm_* names are absent from enabled_features, no GLCM bands are written."""
+    src    = make_raster("opt3.tif", bands=2, dtype="float32")
+    bm     = BandMap(nir=1, red=2)
+    out    = tmp_path / "no_glcm.tif"
+    result = compute_features(src, out, bm, enabled_features=["ndvi"])
+
+    assert result.feature_names == ["ndvi"]
+    with rasterio.open(out) as ds:
+        assert ds.count == 1
+
+
+def test_tile_glcm_skimage_uniform_returns_zeros(tmp_path):
+    """A uniform tile → contrast=0, homogeneity=1, correlation=0, entropy=0."""
+    import math
+    tile = np.ones((32, 32), dtype=np.float64) * 0.5
+    # Uniform → vmax == vmin → early return
+    result = _tile_glcm_skimage(tile, distances=[1],
+                                angles=[0, math.pi/4, math.pi/2, 3*math.pi/4],
+                                levels=32)
+    assert result["contrast"]    == pytest.approx(0.0)
+    assert result["homogeneity"] == pytest.approx(1.0)
+    assert result["entropy"]     == pytest.approx(0.0)
+
+
+def test_tile_glcm_skimage_gradient_has_nonzero_contrast(tmp_path):
+    """A gradient tile must produce positive contrast and entropy."""
+    import math
+    tile = np.tile(np.linspace(0.0, 1.0, 32, dtype=np.float64), (32, 1))
+    result = _tile_glcm_skimage(tile, distances=[1],
+                                angles=[0, math.pi/4, math.pi/2, 3*math.pi/4],
+                                levels=32)
+    assert result["contrast"] > 0.0
+    assert result["entropy"]  > 0.0

@@ -29,10 +29,16 @@ from pipeline import audit, session
 from pipeline.classify import (
     ClassificationConfig,
     ClassificationResult,
-    extract_training_samples,
     predict_raster,
     train_model,
 )
+from pipeline.raster_io import get_meta
+from pipeline.training import (
+    build_shapefile_meta,
+    extract_from_label_raster,
+    extract_from_shapefile,
+)
+from pipeline.validate import check_shapefile_alignment
 from ui._helpers import gate_metric, make_progress_cb, run_output_dir, save_upload
 
 
@@ -143,88 +149,186 @@ def render() -> None:
         f"{len(feat_names)} features: {', '.join(feat_names)}"
     )
 
-    # ── A: Label raster ───────────────────────────────────────────────────
-    st.subheader("A — Label Raster")
-    st.caption(
-        "Upload a single-band integer raster with class labels. "
-        "Must match the spatial extent of the feature stack."
-    )
+    # ── A: Training Data ──────────────────────────────────────────────────
+    st.subheader("A — Training Data")
 
-    st.info(
-        "El label.tif debe tener exactamente el mismo CRS, resolución y extensión "
-        "que el feature stack generado en el paso anterior. "
-        "La app lo validará automáticamente al subirlo.",
-        icon="📐",
-    )
-
-    with st.expander("ℹ️ ¿Qué debe ser el label.tif?"):
-        st.markdown(
-            """
-| Proceso | Formato label.tif | Notas |
-|---|---|---|
-| **Clasificación supervisada (RF/XGBoost)** | 1 banda, dtype `int16`/`uint8`, valores enteros por clase | `0` = nodata, `1..N` = clases. Debe estar reproyectado al mismo CRS y resolución que el feature stack |
-| **Detección de cambio** | No aplica — se usan dos runs consecutivos | El drift monitor compara áreas automáticamente |
-| **Accuracy assessment** | CSV con columnas: `lat`, `lon`, `class_id` | Archivo separado del label.tif |
-"""
-        )
-
-    label_mode = st.radio(
-        "Input mode",
-        options=["Upload file", "Local file path"],
+    training_format = st.radio(
+        "Training data format",
+        options=["Label raster (.tif)", "Shapefile (.shp / .zip)"],
         horizontal=True,
-        key="label_input_mode",
+        key="training_format",
         help=(
-            "**Upload file** — browser upload (size-limited by Streamlit config).  "
-            "**Local file path** — paste a path on the server; no size limit."
+            "**Label raster** — single-band integer GeoTIFF aligned to the feature stack.  "
+            "**Shapefile** — labelled polygon shapefile; class labels read from a column."
         ),
     )
 
     upload_dir = run_output_dir(cfg, run_id, "uploads")
-    label_path: Path | None = None
+    training_path: Path | None = None
+    class_column: str | None   = None
+    max_spp: int               = 500  # max samples per polygon (shapefile mode)
 
-    if label_mode == "Upload file":
-        label_upload = st.file_uploader(
-            "Label raster (.tif)", type=["tif", "tiff"], key="label_upload"
+    if training_format == "Shapefile (.shp / .zip)":
+        st.caption(
+            "Upload a .zip archive containing the .shp bundle, or enter a server path.  "
+            "The shapefile will be reprojected to the feature stack CRS automatically."
         )
-        if label_upload is not None:
-            label_path = save_upload(label_upload, upload_dir)
-            st.success(f"Label raster saved: `{label_path.name}`", icon="✅")
-        else:
-            st.info("Upload a label raster to proceed.", icon="📂")
-            # Re-use previously uploaded label from this session
-            prev = session.get("_label_path")
-            if prev and Path(prev).exists():
-                label_path = Path(prev)
-                st.caption(f"Re-using previous label: `{label_path.name}`")
+        shp_mode = st.radio(
+            "Input mode",
+            options=["Upload file", "Local file path"],
+            horizontal=True,
+            key="shp_input_mode",
+        )
 
-    else:  # Local file path
-        raw_path = st.text_input(
-            "Label raster path",
-            placeholder="/data/labels/training_labels.tif",
-            key="label_local_path",
-        )
-        if raw_path and raw_path.strip():
-            p = Path(raw_path.strip())
-            if not p.exists():
-                st.error(f"File not found — `{p}`", icon="❌")
-            elif not p.is_file():
-                st.error(f"Path is not a regular file — `{p}`", icon="❌")
+        shp_path: Path | None = None
+
+        if shp_mode == "Upload file":
+            shp_upload = st.file_uploader(
+                "Shapefile archive (.zip)", type=["zip"], key="shp_upload"
+            )
+            if shp_upload is not None:
+                shp_path = save_upload(shp_upload, upload_dir)
+                st.success(f"Shapefile saved: `{shp_path.name}`", icon="✅")
             else:
-                label_path = p
-                st.success(f"Label raster found: `{label_path.name}`", icon="✅")
+                st.info("Upload a .zip shapefile archive to proceed.", icon="📂")
+                prev = session.get("training_path")
+                if prev and Path(prev).exists():
+                    shp_path = Path(prev)
+                    st.caption(f"Re-using previous shapefile: `{shp_path.name}`")
         else:
-            st.info("Enter the server-side path to the label raster.", icon="📂")
-            # Re-use previously resolved label path from this session
-            prev = session.get("_label_path")
-            if prev and Path(prev).exists():
-                label_path = Path(prev)
-                st.caption(f"Re-using previous label: `{label_path.name}`")
+            raw_shp = st.text_input(
+                "Shapefile path (.shp or .zip)",
+                placeholder="/data/labels/training_polygons.zip",
+                key="shp_local_path",
+            )
+            if raw_shp and raw_shp.strip():
+                p = Path(raw_shp.strip())
+                if not p.exists():
+                    st.error(f"File not found — `{p}`", icon="❌")
+                elif not p.is_file():
+                    st.error(f"Path is not a regular file — `{p}`", icon="❌")
+                else:
+                    shp_path = p
+                    st.success(f"Shapefile found: `{shp_path.name}`", icon="✅")
+            else:
+                st.info("Enter the server-side path to the shapefile.", icon="📂")
+                prev = session.get("training_path")
+                if prev and Path(prev).exists():
+                    shp_path = Path(prev)
+                    st.caption(f"Re-using previous shapefile: `{shp_path.name}`")
 
-    if label_path is None:
+        if shp_path is not None:
+            # Detect available columns via geopandas
+            try:
+                import geopandas as gpd
+                _gdf_cols = gpd.read_file(str(shp_path)).columns.tolist()
+                _non_geom = [c for c in _gdf_cols if c.lower() != "geometry"]
+            except Exception as _e:
+                st.warning(f"Could not read shapefile columns: {_e}", icon="⚠️")
+                _non_geom = []
+
+            if _non_geom:
+                class_column = st.selectbox(
+                    "Class column",
+                    options=_non_geom,
+                    key="shp_class_column",
+                    help="Column containing integer class labels (one per polygon).",
+                )
+            else:
+                st.error("No columns found in shapefile.", icon="❌")
+
+            max_spp = st.slider(
+                "Max samples per polygon",
+                min_value=10, max_value=5000, value=500, step=10,
+                key="shp_max_spp",
+                help="Caps pixels extracted from each polygon to avoid large-polygon dominance.",
+            )
+
+            # Alignment validation
+            if class_column:
+                try:
+                    feat_meta  = get_meta(feature_path)
+                    shp_meta   = build_shapefile_meta(shp_path, class_column, feat_meta["crs"])
+                    align_res  = check_shapefile_alignment(shp_meta, feat_meta)
+                    if align_res.is_valid:
+                        st.success(align_res.message, icon="✅")
+                    else:
+                        for msg in align_res.errors:
+                            st.error(msg, icon="❌")
+                except Exception as _ae:
+                    st.warning(f"Alignment check skipped: {_ae}", icon="⚠️")
+
+            training_path = shp_path
+
+    else:  # Label raster (.tif)
+        st.caption(
+            "Upload a single-band integer raster with class labels. "
+            "Must match the spatial extent of the feature stack."
+        )
+        st.info(
+            "The label raster must have exactly the same CRS, resolution, and extent "
+            "as the feature stack generated in the previous step. "
+            "The app will validate alignment automatically on upload.",
+            icon="📐",
+        )
+
+        label_mode = st.radio(
+            "Input mode",
+            options=["Upload file", "Local file path"],
+            horizontal=True,
+            key="label_input_mode",
+            help=(
+                "**Upload file** — browser upload (size-limited by Streamlit config).  "
+                "**Local file path** — paste a path on the server; no size limit."
+            ),
+        )
+
+        label_path: Path | None = None
+
+        if label_mode == "Upload file":
+            label_upload = st.file_uploader(
+                "Label raster (.tif)", type=["tif", "tiff"], key="label_upload"
+            )
+            if label_upload is not None:
+                label_path = save_upload(label_upload, upload_dir)
+                st.success(f"Label raster saved: `{label_path.name}`", icon="✅")
+            else:
+                st.info("Upload a label raster to proceed.", icon="📂")
+                prev = session.get("training_path")
+                if prev and Path(prev).exists():
+                    label_path = Path(prev)
+                    st.caption(f"Re-using previous label: `{label_path.name}`")
+        else:
+            raw_path = st.text_input(
+                "Label raster path",
+                placeholder="/data/labels/training_labels.tif",
+                key="label_local_path",
+            )
+            if raw_path and raw_path.strip():
+                p = Path(raw_path.strip())
+                if not p.exists():
+                    st.error(f"File not found — `{p}`", icon="❌")
+                elif not p.is_file():
+                    st.error(f"Path is not a regular file — `{p}`", icon="❌")
+                else:
+                    label_path = p
+                    st.success(f"Label raster found: `{label_path.name}`", icon="✅")
+            else:
+                st.info("Enter the server-side path to the label raster.", icon="📂")
+                prev = session.get("training_path")
+                if prev and Path(prev).exists():
+                    label_path = Path(prev)
+                    st.caption(f"Re-using previous label: `{label_path.name}`")
+
+        training_path = label_path
+
+    if training_path is None:
         return
 
-    # Persist label path within session (lightweight — just a string)
-    session.set_("_label_path", str(label_path))
+    # Persist training path within session (lightweight — just a string)
+    session.set_("training_path", str(training_path))
+    session.set_("training_source",
+                 "shapefile" if training_format.startswith("Shapefile") else "label_raster")
 
     # ── B: Training parameters ────────────────────────────────────────────
     st.divider()
@@ -261,31 +365,36 @@ def render() -> None:
             key="cls_max_depth",
             help="0 means unlimited depth. Applies to RF and XGBoost.",
         )
-        nodata_label = st.number_input(
-            "Nodata label value",
-            min_value=-999, max_value=999, value=0,
-            key="cls_nodata_label",
-            help="Integer pixel value in the label raster meaning 'not labeled'.",
-        )
+        if training_format.startswith("Label"):
+            nodata_label = st.number_input(
+                "Nodata label value",
+                min_value=-999, max_value=999, value=0,
+                key="cls_nodata_label",
+                help="Integer pixel value in the label raster meaning 'not labeled'.",
+            )
+        else:
+            nodata_label = 0  # unused for shapefile path
 
-    st.markdown("**Sample cap**")
-    col3, col4 = st.columns(2)
-    with col3:
-        use_max_samples = st.checkbox(
-            "Limit training samples (max_samples)",
-            value=False,
-            key="cls_use_max_samples",
-            help="Prevents memory issues on very large label rasters.",
-        )
-    with col4:
-        max_samples_val = st.number_input(
-            "Max samples",
-            min_value=1000, max_value=10_000_000, value=100_000, step=10_000,
-            key="cls_max_samples",
-            disabled=not use_max_samples,
-        )
-
-    max_samples = int(max_samples_val) if use_max_samples else None
+    if training_format.startswith("Label"):
+        st.markdown("**Sample cap**")
+        col3, col4 = st.columns(2)
+        with col3:
+            use_max_samples = st.checkbox(
+                "Limit training samples (max_samples)",
+                value=False,
+                key="cls_use_max_samples",
+                help="Prevents memory issues on very large label rasters.",
+            )
+        with col4:
+            max_samples_val = st.number_input(
+                "Max samples",
+                min_value=1000, max_value=10_000_000, value=100_000, step=10_000,
+                key="cls_max_samples",
+                disabled=not use_max_samples,
+            )
+        max_samples = int(max_samples_val) if use_max_samples else None
+    else:
+        max_samples = None  # shapefile mode uses max_spp per polygon instead
 
     class_cfg = ClassificationConfig(
         model_type          = model_type,
@@ -301,24 +410,38 @@ def render() -> None:
     st.subheader("C — Train & Predict")
 
     out_classified = out_dir / f"{run_id}_classified.tif"
+    out_confidence = out_dir / f"{run_id}_confidence.tif"
 
     if st.button("▶ Extract Samples → Train → Predict", type="primary",
                  key="run_classification"):
         try:
             # Step 1 — extract samples (local arrays, freed after training)
             with st.spinner("Extracting training samples…"):
-                X, y = extract_training_samples(
-                    feature_path  = feature_path,
-                    label_path    = label_path,
-                    nodata_label  = int(nodata_label),
-                    max_samples   = max_samples,
-                    random_state  = 42,
-                )
+                if training_format.startswith("Shapefile"):
+                    X, y, class_summary = extract_from_shapefile(
+                        shp_path                = training_path,
+                        feature_path            = feature_path,
+                        class_column            = class_column,
+                        max_samples_per_polygon = max_spp,
+                        random_state            = 42,
+                    )
+                    session.set_("class_column", class_column)
+                else:
+                    X, y, class_summary = extract_from_label_raster(
+                        label_path   = training_path,
+                        feature_path = feature_path,
+                        nodata_label = int(nodata_label),
+                        max_samples  = max_samples,
+                        random_state = 42,
+                    )
+                    session.set_("class_column", None)
             st.info(
                 f"Samples extracted: **{len(y):,}**  |  "
                 f"Classes: {sorted(set(y.tolist()))}",
                 icon="📊",
             )
+            with st.expander("Class distribution"):
+                st.dataframe(class_summary, use_container_width=True, hide_index=True)
 
             # Step 2 — train (X and y stay on the stack, not in session)
             with st.spinner(
@@ -333,29 +456,37 @@ def render() -> None:
             # Free training arrays immediately after model is built
             del X, y
 
-            # Step 3 — predict raster (windowed, no full array in Python)
-            with st.spinner("Predicting classification raster…"):
+            # Step 3 — predict raster + companion confidence map (windowed)
+            with st.spinner("Predicting classification + confidence raster…"):
                 predict_raster(
-                    model         = result.model,
-                    feature_path  = feature_path,
-                    out_path      = out_classified,
-                    feature_names = feat_names,
+                    model            = result.model,
+                    feature_path     = feature_path,
+                    out_path         = out_classified,
+                    feature_names    = feat_names,
+                    confidence_path  = out_confidence,
                 )
 
-            # Persist result and classified path (path only, not pixel data)
+            # Persist result, classified path, and confidence path
             session.set_("model",      result)
             session.set_("classified", str(out_classified))
+            session.set_("confidence", str(out_confidence))
+
+            session.set_("training_source",
+                         "shapefile" if training_format.startswith("Shapefile")
+                         else "label_raster")
 
             audit.log_event(
                 run_id, "gate",
                 {
-                    "stage":       "classification",
-                    "model_type":  result.model_type,
-                    "oa":          round(result.oa, 4),
-                    "kappa":       round(result.kappa, 4),
-                    "minority_f1": round(result.minority_f1, 4),
-                    "smote":       result.smote_applied,
-                    "output":      str(out_classified),
+                    "stage":           "classification",
+                    "model_type":      result.model_type,
+                    "oa":              round(result.oa, 4),
+                    "kappa":           round(result.kappa, 4),
+                    "minority_f1":     round(result.minority_f1, 4),
+                    "smote":           result.smote_applied,
+                    "training_source": session.get("training_source"),
+                    "output":          str(out_classified),
+                    "confidence_path": str(out_confidence),
                 },
                 decision="proceed" if result.gate_passed else "block",
             )

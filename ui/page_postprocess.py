@@ -19,18 +19,27 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+import numpy as np
+import rasterio
+
 from pipeline import audit, session
 from pipeline.postprocess import (
     AccuracyResult,
     ClassAreaResult,
     DriftResult,
+    QualityGateResult,
     assess_accuracy_from_points,
     check_drift,
     compute_class_areas,
+    confidence_filter,
+    has_gate_failures,
+    median_smooth,
     morphological_close,
+    run_postprocess_chain,
+    run_quality_gates,
     sieve_filter,
 )
-from pipeline.raster_io import get_meta
+from pipeline.raster_io import get_meta, iter_windows
 from ui._helpers import gate_metric, run_output_dir, save_upload
 
 
@@ -120,6 +129,72 @@ def _render_accuracy(acc: AccuracyResult, cfg: dict) -> None:
             )
 
 
+def _confidence_stats(confidence_path: Path, threshold: float) -> dict:
+    """
+    Windowed pass over the confidence raster to gather min/max/mean and the
+    fraction of valid pixels below the threshold.  No full-raster read.
+    """
+    total_sum   = 0.0
+    total_count = 0
+    below_count = 0
+    global_min  = float("inf")
+    global_max  = float("-inf")
+
+    with rasterio.open(confidence_path) as ds:
+        for win in iter_windows(ds):
+            tile = ds.read(1, window=win).astype(np.float32)
+            valid = tile >= 0.0   # confidence nodata is -9999.0
+            if not valid.any():
+                continue
+            vals = tile[valid]
+            total_sum   += float(vals.sum())
+            total_count += int(valid.sum())
+            below_count += int((vals < threshold).sum())
+            global_min   = min(global_min, float(vals.min()))
+            global_max   = max(global_max, float(vals.max()))
+
+    mean = total_sum / total_count if total_count > 0 else 0.0
+    pct_below = below_count / total_count * 100.0 if total_count > 0 else 0.0
+    return {
+        "min":         global_min if total_count > 0 else float("nan"),
+        "max":         global_max if total_count > 0 else float("nan"),
+        "mean":        mean,
+        "n_valid":     total_count,
+        "n_below":     below_count,
+        "pct_below":   pct_below,
+    }
+
+
+def _render_quality_gates(gate_results: list[QualityGateResult]) -> None:
+    """Display quality gate results as a color-coded summary table."""
+    _ICONS = {"pass": "✅", "warning": "⚠️", "fail": "❌"}
+    rows = []
+    for r in gate_results:
+        icon = _ICONS.get(r.status, "")
+        rows.append({
+            "Metric":          r.metric_name,
+            "Value":           f"{r.value:.4f}",
+            "Pass threshold":  f"{r.threshold_pass}",
+            "Fail threshold":  f"{r.threshold_fail}",
+            "Result":          f"{icon} {r.status.upper()}",
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    n_fail = sum(1 for r in gate_results if r.status == "fail")
+    n_warn = sum(1 for r in gate_results if r.status == "warning")
+    n_pass = sum(1 for r in gate_results if r.status == "pass")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("✅ PASS",    n_pass)
+    c2.metric("⚠️ WARNING", n_warn)
+    c3.metric("❌ FAIL",    n_fail)
+
+    for r in gate_results:
+        if r.status == "fail":
+            st.error(r.message, icon="❌")
+        elif r.status == "warning":
+            st.warning(r.message, icon="⚠️")
+
+
 # ── Page ──────────────────────────────────────────────────────────────────────
 
 def render() -> None:
@@ -173,6 +248,158 @@ def render() -> None:
 
     # Tracks the "current working raster" through optional filter steps
     working_path = classified_path
+
+    # ── Auto: Post-Processing Chain ───────────────────────────────────────
+    st.subheader("▶ Post-Processing Chain (Express)")
+    st.caption(
+        "Runs all four steps in sequence: **confidence filter → median smooth → "
+        "morphological close → sieve MMU filter**.  "
+        "Parameters are read from the pipeline config."
+    )
+
+    confidence_path_str: str | None = session.get("confidence")
+
+    if not confidence_path_str or not Path(confidence_path_str).exists():
+        st.info(
+            "Confidence raster not available. "
+            "Re-run **ML Classification** to generate it alongside the "
+            "classified raster.",
+            icon="ℹ️",
+        )
+    else:
+        confidence_path = Path(confidence_path_str)
+        conf_threshold  = float(cfg.get("confidence_threshold", 0.6))
+
+        # ── Confidence map statistics (windowed, no full read) ────────────
+        with st.expander("📊 Confidence Map Statistics", expanded=True):
+            try:
+                cstats = _confidence_stats(confidence_path, conf_threshold)
+                cs1, cs2, cs3, cs4 = st.columns(4)
+                with cs1:
+                    st.metric("Mean confidence", f"{cstats['mean']:.3f}")
+                with cs2:
+                    st.metric("Min / Max",
+                              f"{cstats['min']:.3f} / {cstats['max']:.3f}")
+                with cs3:
+                    st.metric("Pixels below threshold",
+                              f"{cstats['n_below']:,}",
+                              help=f"Confidence threshold: {conf_threshold}")
+                with cs4:
+                    st.metric("% below threshold", f"{cstats['pct_below']:.1f}%")
+            except Exception as exc:
+                st.warning(f"Could not compute confidence statistics: {exc}",
+                           icon="⚠️")
+
+        chain_out_dir = run_output_dir(cfg, run_id, "postprocessing")
+
+        if st.button("▶ Run Post-Processing Chain", key="run_chain",
+                     type="primary"):
+            try:
+                steps = [
+                    "confidence_filter",
+                    "median_smooth",
+                    "morphological_close",
+                    "sieve_filter",
+                ]
+                prog_bar = st.progress(0, text="Starting chain…")
+
+                def _progress(msg: str) -> None:
+                    step_idx = next(
+                        (i + 1 for i, s in enumerate(steps) if s in msg),
+                        len(steps),
+                    )
+                    prog_bar.progress(
+                        step_idx / len(steps),
+                        text=f"Step {step_idx}/{len(steps)}: {msg}",
+                    )
+
+                with st.spinner("Running post-processing chain…"):
+                    chain_result = run_postprocess_chain(
+                        classified_path = classified_path,
+                        confidence_path = confidence_path,
+                        cfg             = cfg,
+                        out_dir         = chain_out_dir,
+                        run_id          = run_id,
+                        progress        = _progress,
+                    )
+                prog_bar.progress(1.0, text="Chain complete.")
+
+                final_path = chain_result["final"]
+                session.set_("classified",    str(final_path))
+                session.set_("_chain_result", chain_result)
+                working_path = final_path
+
+                audit.log_event(
+                    run_id, "decision",
+                    {"action": "run_postprocess_chain",
+                     "final_output": str(final_path)},
+                    decision="proceed",
+                )
+                st.success(
+                    f"Chain complete → `{final_path.name}`", icon="✅"
+                )
+
+            except RuntimeError as exc:
+                st.error(str(exc), icon="❌")
+            except Exception as exc:
+                st.error(f"Post-processing chain failed: {exc}", icon="❌")
+                audit.log_event(
+                    run_id, "error",
+                    {"stage": "postprocess_chain", "error": str(exc)},
+                )
+
+        # ── Before / after comparison ─────────────────────────────────────
+        chain_result_stored = session.get("_chain_result")
+        if chain_result_stored:
+            final_chain_path = chain_result_stored.get("final")
+            if final_chain_path and Path(final_chain_path).exists():
+                st.markdown("**Before / After Comparison**")
+                bc1, bc2 = st.columns(2)
+
+                def _quick_areas(path: Path) -> dict[int, int] | None:
+                    """Return {class: pixel_count} without computing ha."""
+                    from pipeline.postprocess import iter_windows as _iw
+                    counts: dict[int, int] = {}
+                    try:
+                        with rasterio.open(path) as ds:
+                            nd = int(ds.nodata) if ds.nodata is not None else -1
+                            for w in iter_windows(ds):
+                                tile = ds.read(1, window=w)
+                                vals, cnts = np.unique(
+                                    tile[tile != nd], return_counts=True
+                                )
+                                for v, c in zip(vals.tolist(), cnts.tolist()):
+                                    counts[v] = counts.get(v, 0) + c
+                    except Exception:
+                        return None
+                    return counts
+
+                with bc1:
+                    st.caption("**Before** (original classified)")
+                    before_counts = _quick_areas(classified_path)
+                    if before_counts:
+                        import pandas as pd
+                        st.dataframe(
+                            pd.DataFrame(
+                                [{"Class": k, "Pixels": v}
+                                 for k, v in sorted(before_counts.items())]
+                            ),
+                            use_container_width=True, hide_index=True,
+                        )
+                with bc2:
+                    st.caption("**After** (chain final output)")
+                    after_counts = _quick_areas(Path(final_chain_path))
+                    if after_counts:
+                        import pandas as pd
+                        st.dataframe(
+                            pd.DataFrame(
+                                [{"Class": k, "Pixels": v}
+                                 for k, v in sorted(after_counts.items())]
+                            ),
+                            use_container_width=True, hide_index=True,
+                        )
+
+    st.divider()
 
     # ── A: Sieve filter (MMU) ─────────────────────────────────────────────
     st.subheader("A — Sieve Filter (Minimum Mapping Unit)")
@@ -447,13 +674,83 @@ def render() -> None:
     if acc_result is not None:
         _render_accuracy(acc_result, cfg)
 
+    # ── ▶: Quality Gate Assessment ────────────────────────────────────────
+    st.divider()
+    st.subheader("▶ Quality Gate Assessment")
+    st.caption(
+        "Evaluates classification quality across 3-tier gates "
+        "(PASS / WARNING / FAIL). All thresholds are read from "
+        "`pipeline_config.yaml`. Re-run after accuracy assessment to include "
+        "independent OA in the evaluation."
+    )
+
+    # Build confidence_stats for the gate (only need mean)
+    _conf_stats_gate: dict | None = None
+    _confidence_path_str = session.get("confidence")
+    if _confidence_path_str and Path(_confidence_path_str).exists():
+        try:
+            _cstats = _confidence_stats(
+                Path(_confidence_path_str),
+                float(cfg.get("confidence_threshold", 0.6)),
+            )
+            _conf_stats_gate = {"mean": _cstats["mean"]}
+        except Exception:
+            pass
+
+    # Compute nodata fraction if class areas are available
+    _nodata_pct: float | None = None
+    _areas_now: ClassAreaResult | None = session.get("class_areas")
+    if _areas_now is not None:
+        try:
+            _total_px = meta["width"] * meta["height"]
+            _valid_px = sum(_areas_now.pixel_counts.values())
+            if _total_px > 0:
+                _nodata_pct = (_total_px - _valid_px) / _total_px
+        except Exception:
+            pass
+
+    if st.button("▶ Evaluate Quality Gates", key="run_quality_gates",
+                 type="primary"):
+        _gate_results = run_quality_gates(
+            model_result     = session.get("model"),
+            accuracy_result  = session.get("accuracy"),
+            class_areas      = _areas_now,
+            confidence_stats = _conf_stats_gate,
+            cfg              = cfg,
+            nodata_pct       = _nodata_pct,
+        )
+        session.set_("quality_gate_results", _gate_results)
+        audit.log_event(
+            run_id, "gate",
+            {
+                "stage":   "quality_gate_assessment",
+                "results": [
+                    {"metric": r.metric_name,
+                     "value":  round(r.value, 4),
+                     "status": r.status}
+                    for r in _gate_results
+                ],
+            },
+            decision=(
+                "block"   if has_gate_failures(_gate_results)
+                else "proceed"
+            ),
+        )
+        st.rerun()
+
+    gate_results: list[QualityGateResult] | None = session.get(
+        "quality_gate_results"
+    )
+    if gate_results is not None:
+        _render_quality_gates(gate_results)
+
     # ── F: Unlock gate ────────────────────────────────────────────────────
     st.divider()
     if session.is_unlocked("export"):
         st.success("Export & Delivery already unlocked.", icon="✅")
         return
 
-    # Spatial filters are the gate — accuracy assessment is optional
+    # Spatial filters are the minimum requirement
     classified_final = session.get("classified")
     if not classified_final or not Path(classified_final).exists():
         st.info(
@@ -462,16 +759,69 @@ def render() -> None:
         )
         return
 
-    st.success(
-        "Post-processing complete. Proceed to Export & Delivery.", icon="✅"
-    )
-    if st.button("🔓 Unlock Export & Delivery →", type="primary"):
-        session.unlock_stage("export")
-        audit.log_event(
-            run_id, "decision",
-            {"action": "unlock_export",
-             "classified_path": classified_final,
-             "has_accuracy": acc_result is not None},
-            decision="proceed",
+    # Quality gate results required before unlock
+    if gate_results is None:
+        st.info(
+            "Run **▶ Evaluate Quality Gates** above before unlocking Export.",
+            icon="ℹ️",
         )
-        st.rerun()
+        return
+
+    if has_gate_failures(gate_results):
+        st.error(
+            "**Quality gate FAILED.**  "
+            "Resolve the issues above or override to proceed.",
+            icon="🚫",
+        )
+        override = st.checkbox(
+            "⚠️ Override quality gate failures and proceed anyway",
+            key="gate_override_export",
+        )
+        if override:
+            st.warning(
+                "Gate override active — exported results may not meet quality "
+                "standards. This decision is recorded in the audit log.",
+                icon="⚠️",
+            )
+            if st.button("🔓 Unlock Export & Delivery (override) →"):
+                session.unlock_stage("export")
+                audit.log_event(
+                    run_id, "decision",
+                    {
+                        "action":          "override_quality_gate_export",
+                        "failed_metrics":  [
+                            r.metric_name for r in gate_results
+                            if r.status == "fail"
+                        ],
+                        "classified_path": classified_final,
+                    },
+                    decision="override",
+                )
+                st.rerun()
+    else:
+        _n_warn = sum(1 for r in gate_results if r.status == "warning")
+        if _n_warn > 0:
+            st.warning(
+                f"Quality gate passed with **{_n_warn} warning(s)** — "
+                "review results above before exporting.",
+                icon="⚠️",
+            )
+        else:
+            st.success(
+                "All quality gates passed. Proceed to Export & Delivery.",
+                icon="✅",
+            )
+        if st.button("🔓 Unlock Export & Delivery →", type="primary"):
+            session.unlock_stage("export")
+            audit.log_event(
+                run_id, "decision",
+                {
+                    "action":           "unlock_export",
+                    "classified_path":  classified_final,
+                    "gate_status":      "warning" if _n_warn > 0 else "pass",
+                    "n_warnings":       _n_warn,
+                    "has_accuracy":     acc_result is not None,
+                },
+                decision="proceed",
+            )
+            st.rerun()

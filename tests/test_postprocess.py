@@ -25,7 +25,10 @@ from pipeline.postprocess import (
     assess_accuracy_from_points,
     check_drift,
     compute_class_areas,
+    confidence_filter,
+    median_smooth,
     morphological_close,
+    run_postprocess_chain,
     sieve_filter,
 )
 
@@ -501,3 +504,270 @@ class TestCheckDrift:
                              cfg={"drift_alert_pct": 20})
         assert 1 in result.flagged_classes
         assert result.drift_alert_pct == pytest.approx(20.0)
+
+
+# ── Helpers for confidence tests ──────────────────────────────────────────────
+
+def _make_confidence(
+    tmp_path:  Path,
+    data:      np.ndarray,      # 2-D float array (rows, cols)
+    res:       float = 10.0,
+    nodata:    float = -9999.0,
+    crs_epsg:  int   = 32633,
+    filename:  str   = "confidence.tif",
+) -> Path:
+    """Write a single-band float32 confidence raster to tmp_path."""
+    path      = tmp_path / filename
+    height, width = data.shape
+    transform = from_origin(500_000.0, 5_000_200.0, res, res)
+    profile   = {
+        "driver":    "GTiff",
+        "dtype":     "float32",
+        "width":     width,
+        "height":    height,
+        "count":     1,
+        "transform": transform,
+        "nodata":    nodata,
+        "crs":       CRS.from_epsg(crs_epsg) if crs_epsg else None,
+    }
+    with rasterio.open(path, "w", **profile) as ds:
+        ds.write(data.astype(np.float32)[np.newaxis, :, :])
+    return path
+
+
+# ── confidence_filter ─────────────────────────────────────────────────────────
+
+class TestConfidenceFilter:
+
+    @pytest.fixture(autouse=True)
+    def _require_scipy(self) -> None:
+        pytest.importorskip("scipy", reason="scipy not available")
+
+    def test_low_confidence_pixel_replaced(self, tmp_path: Path) -> None:
+        """A single low-confidence pixel in a field of class 1 should be
+        replaced by the local median (which is also class 1)."""
+        data_cls = np.ones((15, 15), dtype=np.int16)
+        data_cls[7, 7] = 2                              # lone class-2 pixel
+        cls_path = _make_classified(tmp_path, data_cls, nodata=-1)
+
+        # Confidence: 0.9 everywhere except the class-2 pixel (0.2 < threshold)
+        data_conf = np.full((15, 15), 0.9, dtype=np.float32)
+        data_conf[7, 7] = 0.2
+        conf_path = _make_confidence(tmp_path, data_conf)
+
+        out_path = tmp_path / "filtered.tif"
+        confidence_filter(cls_path, conf_path, threshold=0.6, out_path=out_path)
+
+        assert out_path.exists()
+        with rasterio.open(out_path) as ds:
+            result = ds.read(1)
+
+        # Low-confidence pixel replaced with median of 5×5 neighbourhood (all 1s)
+        assert result[7, 7] == 1
+
+    def test_high_confidence_pixels_unchanged(self, tmp_path: Path) -> None:
+        """Pixels with confidence >= threshold must not be modified."""
+        data_cls  = np.array([[1, 2], [3, 4]], dtype=np.int16)
+        data_conf = np.full((2, 2), 0.95, dtype=np.float32)
+        cls_path  = _make_classified(tmp_path, data_cls)
+        conf_path = _make_confidence(tmp_path, data_conf)
+
+        out_path = tmp_path / "unchanged.tif"
+        confidence_filter(cls_path, conf_path, threshold=0.6, out_path=out_path)
+
+        with rasterio.open(out_path) as ds:
+            result = ds.read(1)
+        assert np.array_equal(result, data_cls.astype(result.dtype))
+
+    def test_nodata_pixels_preserved(self, tmp_path: Path) -> None:
+        """Nodata pixels in the classified raster must never be modified."""
+        data_cls = np.array([[1, -1, 1], [1, 1, 1]], dtype=np.int16)
+        # All confidence low — but nodata pixel at (0,1) must stay nodata
+        data_conf = np.full((2, 3), 0.1, dtype=np.float32)
+        cls_path  = _make_classified(tmp_path, data_cls, nodata=-1)
+        conf_path = _make_confidence(tmp_path, data_conf)
+
+        out_path = tmp_path / "nodata.tif"
+        confidence_filter(cls_path, conf_path, threshold=0.6, out_path=out_path)
+
+        with rasterio.open(out_path) as ds:
+            result = ds.read(1)
+        assert result[0, 1] == -1
+
+    def test_confidence_nodata_not_treated_as_low(self, tmp_path: Path) -> None:
+        """Confidence nodata (-9999.0) must not trigger a replacement because
+        -9999.0 is not >= 0."""
+        data_cls  = np.ones((5, 5), dtype=np.int16)
+        data_cls[2, 2] = 2
+        data_conf = np.full((5, 5), 0.9, dtype=np.float32)
+        data_conf[2, 2] = -9999.0   # nodata confidence, not "low" confidence
+        cls_path  = _make_classified(tmp_path, data_cls)
+        conf_path = _make_confidence(tmp_path, data_conf)
+
+        out_path = tmp_path / "confnd.tif"
+        confidence_filter(cls_path, conf_path, threshold=0.6, out_path=out_path)
+
+        with rasterio.open(out_path) as ds:
+            result = ds.read(1)
+        assert result[2, 2] == 2   # unchanged — conf nodata ≠ low confidence
+
+    def test_output_file_created(self, tmp_path: Path) -> None:
+        data_cls  = np.ones((10, 10), dtype=np.int16)
+        data_conf = np.full((10, 10), 0.8, dtype=np.float32)
+        cls_path  = _make_classified(tmp_path, data_cls)
+        conf_path = _make_confidence(tmp_path, data_conf)
+        out_path  = tmp_path / "created.tif"
+        confidence_filter(cls_path, conf_path, threshold=0.6, out_path=out_path)
+        assert out_path.exists()
+
+
+# ── median_smooth ─────────────────────────────────────────────────────────────
+
+class TestMedianSmooth:
+
+    @pytest.fixture(autouse=True)
+    def _require_scipy(self) -> None:
+        pytest.importorskip("scipy", reason="scipy not available")
+
+    def test_even_kernel_raises(self, tmp_path: Path) -> None:
+        path = _make_classified(tmp_path, np.ones((10, 10), dtype=np.int16))
+        with pytest.raises(ValueError, match="odd integer"):
+            median_smooth(path, tmp_path / "out.tif", kernel_size=4)
+
+    def test_kernel_size_1_raises(self, tmp_path: Path) -> None:
+        path = _make_classified(tmp_path, np.ones((10, 10), dtype=np.int16))
+        with pytest.raises(ValueError, match="odd integer"):
+            median_smooth(path, tmp_path / "out.tif", kernel_size=1)
+
+    def test_output_file_created(self, tmp_path: Path) -> None:
+        data = np.ones((20, 20), dtype=np.int16)
+        path = _make_classified(tmp_path, data)
+        out  = median_smooth(path, tmp_path / "smoothed.tif", kernel_size=3)
+        assert out.exists()
+
+    def test_uniform_raster_unchanged(self, tmp_path: Path) -> None:
+        data = np.full((20, 20), 3, dtype=np.int16)
+        path = _make_classified(tmp_path, data)
+        out  = median_smooth(path, tmp_path / "smoothed.tif", kernel_size=3)
+        with rasterio.open(out) as ds:
+            arr = ds.read(1)
+        assert np.all(arr == 3)
+
+    def test_isolated_pixel_reduced(self, tmp_path: Path) -> None:
+        """An isolated class-2 pixel surrounded by class-1 pixels should be
+        smoothed to class 1 by a 3×3 median (8 ones vs 1 two → median = 1)."""
+        data       = np.full((15, 15), 1, dtype=np.int16)
+        data[7, 7] = 2
+        path = _make_classified(tmp_path, data, nodata=-1)
+        out  = median_smooth(path, tmp_path / "smoothed.tif", kernel_size=3)
+        with rasterio.open(out) as ds:
+            arr = ds.read(1)
+        assert arr[7, 7] == 1
+
+    def test_nodata_preserved(self, tmp_path: Path) -> None:
+        """Nodata pixels must remain nodata after smoothing."""
+        data       = np.ones((10, 10), dtype=np.int16)
+        data[5, 5] = -1
+        path = _make_classified(tmp_path, data, nodata=-1)
+        out  = median_smooth(path, tmp_path / "smoothed.tif", kernel_size=3)
+        with rasterio.open(out) as ds:
+            arr = ds.read(1)
+        assert arr[5, 5] == -1
+
+
+# ── run_postprocess_chain ─────────────────────────────────────────────────────
+
+class TestRunPostprocessChain:
+
+    @pytest.fixture(autouse=True)
+    def _require_deps(self) -> None:
+        pytest.importorskip("scipy",    reason="scipy not available")
+        pytest.importorskip("osgeo.gdal", reason="GDAL not available")
+
+    def _build_inputs(
+        self, tmp_path: Path, size: int = 30
+    ) -> tuple[Path, Path]:
+        """Create a minimal classified + confidence raster pair."""
+        data_cls = np.ones((size, size), dtype=np.int16)
+        # Small patch of class 2 for sieve to potentially absorb
+        data_cls[2:5, 2:5] = 2
+
+        data_conf = np.full((size, size), 0.9, dtype=np.float32)
+        # A few low-confidence pixels to exercise confidence_filter
+        data_conf[10:13, 10:13] = 0.3
+
+        cls_path  = _make_classified(tmp_path, data_cls, res=10.0, nodata=-1)
+        conf_path = _make_confidence(tmp_path, data_conf)
+        return cls_path, conf_path
+
+    def test_chain_produces_final_output(self, tmp_path: Path) -> None:
+        cls_path, conf_path = self._build_inputs(tmp_path)
+        cfg = {
+            "confidence_threshold":    0.6,
+            "median_filter_size":      3,
+            "morphological_kernel_size": 3,
+            "morphological_iterations":  1,
+            "min_mapping_unit_ha":     0.001,
+            "sieve_connectivity":      4,
+        }
+        result = run_postprocess_chain(
+            classified_path = cls_path,
+            confidence_path = conf_path,
+            cfg             = cfg,
+            out_dir         = tmp_path / "chain_out",
+            run_id          = "test_run",
+        )
+        assert "final" in result
+        assert Path(result["final"]).exists()
+
+    def test_chain_produces_all_intermediates(self, tmp_path: Path) -> None:
+        cls_path, conf_path = self._build_inputs(tmp_path)
+        cfg = {
+            "confidence_threshold":    0.6,
+            "median_filter_size":      3,
+            "morphological_kernel_size": 3,
+            "morphological_iterations":  1,
+            "min_mapping_unit_ha":     0.001,
+            "sieve_connectivity":      4,
+        }
+        result = run_postprocess_chain(
+            cls_path, conf_path, cfg,
+            out_dir = tmp_path / "chain_out2",
+            run_id  = "test_run2",
+        )
+        for key in ("confidence_filtered", "median_smoothed",
+                    "morphologically_closed", "final"):
+            assert key in result, f"Missing key: {key}"
+            assert Path(result[key]).exists(), f"File not found: {result[key]}"
+
+    def test_chain_progress_callback_called(self, tmp_path: Path) -> None:
+        cls_path, conf_path = self._build_inputs(tmp_path)
+        cfg = {
+            "confidence_threshold":    0.6,
+            "median_filter_size":      3,
+            "morphological_kernel_size": 3,
+            "morphological_iterations":  1,
+            "min_mapping_unit_ha":     0.001,
+            "sieve_connectivity":      4,
+        }
+        messages: list[str] = []
+        run_postprocess_chain(
+            cls_path, conf_path, cfg,
+            out_dir  = tmp_path / "chain_out3",
+            run_id   = "test_run3",
+            progress = messages.append,
+        )
+        assert len(messages) == 4   # one message per step
+
+    def test_chain_non_projected_crs_raises(self, tmp_path: Path) -> None:
+        """A raster with geographic CRS must raise ValueError."""
+        data_cls  = np.ones((10, 10), dtype=np.int16)
+        data_conf = np.full((10, 10), 0.9, dtype=np.float32)
+        cls_path  = _make_classified(tmp_path, data_cls,  crs_epsg=4326)
+        conf_path = _make_confidence(tmp_path, data_conf, crs_epsg=4326)
+        with pytest.raises(ValueError, match="non-projected"):
+            run_postprocess_chain(
+                cls_path, conf_path, {},
+                out_dir = tmp_path / "err",
+                run_id  = "err_run",
+            )

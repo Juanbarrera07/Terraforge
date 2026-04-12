@@ -48,6 +48,10 @@ _DEFAULTS: dict[str, Any] = {
     "coreg_results":        None,   # dict[str, CoregistrationResult] — from preprocessing
     "class_areas":          None,   # ClassAreaResult — from postprocess
     "export_manifest":      None,   # ExportManifest — from export
+    # ── Training data metadata ────────────────────────────────────────────────
+    "training_source":      None,   # str  — "label_raster" | "shapefile"
+    "training_path":        None,   # str  — path to shapefile or label raster
+    "class_column":         None,   # str  — class column name (shapefile only)
 }
 
 
@@ -129,6 +133,9 @@ def new_run() -> str:
     st.session_state.coreg_results        = None
     st.session_state.class_areas          = None
     st.session_state.export_manifest      = None
+    st.session_state.training_source      = None
+    st.session_state.training_path        = None
+    st.session_state.class_column         = None
 
     # Clean previous run's tmp — best-effort, never blocks the new run.
     if old_run_id and cfg:

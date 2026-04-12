@@ -4,15 +4,34 @@
 # ── Coregistration ────────────────────────────────────────────────────────────
 coreg_rmse_threshold: 0.5          # pixels — hard stop above this
 
-# ── ML Quality Gates ─────────────────────────────────────────────────────────
+# ── ML Quality Gates (2-tier legacy) ─────────────────────────────────────────
 min_oa_threshold: 0.80             # overall accuracy — block export below this
 min_minority_f1: 0.70              # minority class F1 — block export below this
+
+# ── 3-tier Quality Gates ──────────────────────────────────────────────────────
+# Each metric has a pass threshold (ideal) and a fail threshold (hard stop).
+# Values between the two thresholds produce a WARNING (proceed with caution).
+quality_gate_oa_pass: 0.90         # OA ≥ 0.90 → PASS;  0.80–0.90 → WARNING
+quality_gate_oa_fail: 0.80         # OA < 0.80 → FAIL
+quality_gate_kappa_pass: 0.80      # Kappa ≥ 0.80 → PASS; 0.65–0.80 → WARNING
+quality_gate_kappa_fail: 0.65      # Kappa < 0.65 → FAIL
+quality_gate_f1_pass: 0.70         # Minority F1 ≥ 0.70 → PASS; 0.50–0.70 → WARNING
+quality_gate_f1_fail: 0.50         # Minority F1 < 0.50 → FAIL
+quality_gate_confidence_pass: 0.75 # Mean confidence ≥ 0.75 → PASS; 0.60–0.75 → WARNING
+quality_gate_confidence_fail: 0.60 # Mean confidence < 0.60 → FAIL
+quality_gate_nodata_pass: 0.05     # Nodata fraction ≤ 5% → PASS; 5–10% → WARNING
+quality_gate_nodata_fail: 0.10     # Nodata fraction > 10% → FAIL
 
 # ── Drift Monitor ────────────────────────────────────────────────────────────
 drift_alert_pct: 20                # % class area change vs previous run → anomaly flag
 
 # ── Post-processing ──────────────────────────────────────────────────────────
 min_mapping_unit_ha: 0.5           # sieve filter default (ha)
+confidence_threshold: 0.6          # pixels below this confidence are replaced by local median
+median_filter_size: 3              # kernel size for the median-smooth step
+morphological_kernel_size: 3       # structuring element size for morphological closing
+morphological_iterations: 1        # number of morphological closing passes
+sieve_connectivity: 4              # pixel connectivity for GDAL sieve filter (4 or 8)
 
 # ── ML Training ──────────────────────────────────────────────────────────────
 default_k_folds: 5
@@ -26,6 +45,8 @@ phenology_month_gap: 2             # warn if layers span more than this many cal
 
 # ── Feature Engineering ──────────────────────────────────────────────────────
 corr_flag_threshold: 0.95          # flag feature pairs with |r| strictly above this (> not >=)
+glcm_window_size: 7                # overlap padding for GLCM tile reads = window_size // 2
+glcm_levels: 32                    # grey-level quantisation bins for GLCM computation
 
 # ── SAR preprocessing ────────────────────────────────────────────────────────
 sar_enl_default: 1.0              # single-look conservative default
