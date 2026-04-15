@@ -146,6 +146,199 @@ def _vari(green: np.ndarray, red: np.ndarray, blue: np.ndarray) -> np.ndarray:
     return _safe_ratio(green - red, green + red - blue, fill=np.nan)
 
 
+# ── Mining-specific spectral indices ─────────────────────────────────────────
+
+def _iron_oxide(red: np.ndarray, blue: np.ndarray) -> np.ndarray:
+    """
+    Iron Oxide Ratio: Red / Blue.
+
+    High values indicate iron-oxide alteration (gossans, weathered pit walls,
+    oxidised tailings).  Discriminates fresh vs oxidised rock at pit walls.
+    """
+    return _safe_ratio(red, blue, fill=np.nan)
+
+
+def _clay_index(swir: np.ndarray, nir: np.ndarray) -> np.ndarray:
+    """
+    Clay / Hydroxyl Index: SWIR1 / NIR.
+
+    High values indicate clay minerals and hydroxyl-bearing alteration
+    (kaolinite, alunite, jarosite).  Key indicator of weathered/altered
+    material in pit walls and TSF surfaces.
+    """
+    return _safe_ratio(swir, nir, fill=np.nan)
+
+
+def _ferrous(nir: np.ndarray, swir: np.ndarray) -> np.ndarray:
+    """
+    Ferrous Iron Index: NIR / SWIR1.
+
+    Inverse of clay_index.  High values indicate ferrous minerals (pyrite,
+    magnetite) in fresh or partially oxidised rock.  Helps discriminate
+    between fresh rock and weathered/oxidised material in pit walls.
+    """
+    return _safe_ratio(nir, swir, fill=np.nan)
+
+
+def _mndwi(green: np.ndarray, swir: np.ndarray) -> np.ndarray:
+    """
+    Modified NDWI: (Green − SWIR1) / (Green + SWIR1).
+
+    Outperforms standard NDWI for turbid water bodies with suspended
+    sediment (ponded water in TSF, seepage zones).  Also suppresses built-up
+    and dry tailings surfaces more effectively than standard NDWI.
+    """
+    return _safe_ratio(green - swir, green + swir, fill=np.nan)
+
+
+def _exg(green: np.ndarray, red: np.ndarray, blue: np.ndarray) -> np.ndarray:
+    """
+    Excess Green Index: 2·Green − Red − Blue.
+
+    RGB-only vegetation proxy.  Positive in vegetated areas, near-zero for
+    bare soil/rock.  Essential when NIR is absent (drone RGB).
+    """
+    return 2.0 * green - red - blue
+
+
+def _exr(red: np.ndarray, green: np.ndarray) -> np.ndarray:
+    """
+    Excess Red Index: 1.4·Red − Green.
+
+    Highlights iron-oxide-rich and oxidised surfaces in drone RGB imagery
+    where SWIR is unavailable.  High values = reddish oxidised material.
+    """
+    return 1.4 * red - green
+
+
+def _brightness(red: np.ndarray, green: np.ndarray, blue: np.ndarray) -> np.ndarray:
+    """
+    RGB Brightness: (Red + Green + Blue) / 3.
+
+    Proxy for total reflectance.  High in dry tailings and exposed rock,
+    low in water and dense vegetation.
+    """
+    return (red + green + blue) / 3.0
+
+
+def _rgb_hue(red: np.ndarray, green: np.ndarray, blue: np.ndarray) -> np.ndarray:
+    """
+    Hue channel from HSV colour space (numpy, no sklearn).
+
+    Encodes dominant colour wavelength — discriminates brown/orange oxidised
+    rock from grey fresh rock and green vegetation at high (drone) resolution.
+    Output range: [0, 1) (normalised from 360°).
+    """
+    r, g, b = red, green, blue
+    cmax = np.maximum(np.maximum(r, g), b)
+    cmin = np.minimum(np.minimum(r, g), b)
+    delta = cmax - cmin
+
+    hue = np.zeros_like(r, dtype=np.float64)
+    eps = 1e-9
+
+    mask_r = (cmax == r) & (delta > eps)
+    mask_g = (cmax == g) & (delta > eps)
+    mask_b = (cmax == b) & (delta > eps)
+
+    hue[mask_r] = (60.0 * ((g[mask_r] - b[mask_r]) / delta[mask_r])) % 360.0
+    hue[mask_g] = (60.0 * ((b[mask_g] - r[mask_g]) / delta[mask_g]) + 120.0) % 360.0
+    hue[mask_b] = (60.0 * ((r[mask_b] - g[mask_b]) / delta[mask_b]) + 240.0) % 360.0
+
+    return hue / 360.0  # normalise to [0, 1)
+
+
+def _rgb_saturation(
+    red: np.ndarray, green: np.ndarray, blue: np.ndarray
+) -> np.ndarray:
+    """
+    Saturation channel from HSV colour space (numpy, no sklearn).
+
+    High saturation = vivid colour (oxidised red rock, green vegetation).
+    Low saturation = grey/white (fresh rock, dry tailings, shadow).
+    Output range: [0, 1].
+    """
+    cmax = np.maximum(np.maximum(red, green), blue)
+    cmin = np.minimum(np.minimum(red, green), blue)
+    delta = cmax - cmin
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sat = np.where(cmax > 1e-9, delta / cmax, 0.0)
+    return sat.astype(np.float64)
+
+
+def _roughness_proxy(dem: np.ndarray, res: float) -> np.ndarray:
+    """
+    Terrain roughness proxy: local standard deviation of slope in a 3×3 window.
+
+    High roughness indicates irregular terrain — relevant for detecting
+    displacement zones, cracking and loose material on pit wall slopes.
+    Uses scipy.ndimage.uniform_filter for O(N) efficiency.
+    """
+    from scipy.ndimage import uniform_filter as _uf  # noqa: PLC0415
+
+    slope = _slope(dem, res)
+    valid = np.isfinite(slope)
+    if not valid.any():
+        return np.full_like(slope, np.nan, dtype=np.float64)
+
+    slope_filled = np.where(valid, slope, 0.0)
+    valid_mean = _uf(valid.astype(np.float64), size=3, mode="nearest")
+    # E[X²] - E[X]²  via two box-filter passes
+    mean_s = _safe_ratio(
+        _uf(slope_filled, size=3, mode="nearest"),
+        valid_mean,
+        fill=np.nan,
+    )
+    mean_s2 = _safe_ratio(
+        _uf(slope_filled ** 2, size=3, mode="nearest"),
+        valid_mean,
+        fill=np.nan,
+    )
+    var = np.maximum(mean_s2 - mean_s ** 2, 0.0)
+    roughness = np.sqrt(var)
+    roughness[~valid] = np.nan
+    return roughness
+
+
+def _mining_features(band_map: BandMap, drone_rgb_only: bool = False) -> list[str]:
+    """
+    Return mining-specific feature names computable from *band_map*.
+
+    These are ADDITIONAL to the base features returned by _active_features().
+    They activate when specific band combinations are present.
+
+    Parameters
+    ----------
+    drone_rgb_only : If True, only return features computable from RGB
+                     (no NIR/SWIR required).
+    """
+    bm = band_map
+    feats: list[str] = []
+
+    if not drone_rgb_only:
+        # Multispectral mining indices
+        if bm.red and bm.blue:
+            feats.append("iron_oxide")
+        if bm.swir and bm.nir:
+            feats.append("clay_index")
+        if bm.nir and bm.swir:
+            feats.append("ferrous")
+        if bm.green and bm.swir:
+            feats.append("mndwi")
+        if bm.dem:
+            feats.append("roughness_proxy")
+
+    # Drone RGB-only indices (always added when RGB present)
+    if bm.red and bm.green and bm.blue:
+        feats.append("exg")
+        feats.append("exr")
+        feats.append("brightness")
+        feats.append("hue")
+        feats.append("saturation")
+
+    return feats
+
+
 def _sar_ratio(
     vv: np.ndarray, vh: np.ndarray, log_scale: bool = False
 ) -> np.ndarray:
@@ -172,7 +365,9 @@ def _slope(dem: np.ndarray, res: float) -> np.ndarray:
     """
     safe_res = max(res, 1e-9)
     dy, dx = np.gradient(dem, safe_res, safe_res)
-    return np.sqrt(dx ** 2 + dy ** 2)
+    slope = np.sqrt(dx ** 2 + dy ** 2)
+    slope[~np.isfinite(dem)] = np.nan
+    return slope
 
 
 def _aspect(dem: np.ndarray, res: float) -> np.ndarray:
@@ -183,7 +378,9 @@ def _aspect(dem: np.ndarray, res: float) -> np.ndarray:
     """
     safe_res = max(res, 1e-9)
     dy, dx = np.gradient(dem, safe_res, safe_res)
-    return np.degrees(np.arctan2(-dy, dx)) % 360.0
+    aspect = np.degrees(np.arctan2(-dy, dx)) % 360.0
+    aspect[~np.isfinite(dem)] = np.nan
+    return aspect
 
 
 # ── GLCM texture (tile-level, pure NumPy) ────────────────────────────────────
@@ -333,6 +530,30 @@ def _compute_tile_features(
             out[fi] = _slope(_b(bm.dem), res)                 # type: ignore[arg-type]
         elif name == "aspect":
             out[fi] = _aspect(_b(bm.dem), res)                # type: ignore[arg-type]
+        # ── Mining-specific indices ───────────────────────────────────────────
+        elif name == "iron_oxide":
+            out[fi] = _iron_oxide(_b(bm.red), _b(bm.blue))   # type: ignore[arg-type]
+        elif name == "clay_index":
+            out[fi] = _clay_index(_b(bm.swir), _b(bm.nir))   # type: ignore[arg-type]
+        elif name == "ferrous":
+            out[fi] = _ferrous(_b(bm.nir), _b(bm.swir))      # type: ignore[arg-type]
+        elif name == "mndwi":
+            out[fi] = _mndwi(_b(bm.green), _b(bm.swir))      # type: ignore[arg-type]
+        elif name == "roughness_proxy":
+            out[fi] = _roughness_proxy(_b(bm.dem), res)       # type: ignore[arg-type]
+        # ── Drone RGB-only features ───────────────────────────────────────────
+        elif name == "exg":
+            out[fi] = _exg(_b(bm.green), _b(bm.red), _b(bm.blue))  # type: ignore[arg-type]
+        elif name == "exr":
+            out[fi] = _exr(_b(bm.red), _b(bm.green))         # type: ignore[arg-type]
+        elif name == "brightness":
+            out[fi] = _brightness(_b(bm.red), _b(bm.green), _b(bm.blue))  # type: ignore[arg-type]
+        elif name == "hue":
+            out[fi] = _rgb_hue(_b(bm.red), _b(bm.green), _b(bm.blue))  # type: ignore[arg-type]
+        elif name == "saturation":
+            out[fi] = _rgb_saturation(_b(bm.red), _b(bm.green), _b(bm.blue))  # type: ignore[arg-type]
+        else:
+            out[fi] = np.full((H, W), np.nan, dtype=np.float64)
 
     return out
 
@@ -657,14 +878,32 @@ def compute_glcm_features(
     return resolved
 
 
-def active_features(band_map: BandMap) -> list[str]:
+def active_features(band_map: BandMap, cfg: Optional[dict] = None) -> list[str]:
     """
     Return the ordered list of feature names computable from *band_map*.
 
     This is the public entry point for the UI layer to preview which features
     are available before calling compute_features().
+
+    When ``cfg`` has ``mining_features_enabled: true``, mining-specific
+    features (iron_oxide, clay_index, ferrous, mndwi, roughness_proxy) are
+    appended to the base list.
     """
-    return _active_features(band_map)
+    feats = list(_active_features(band_map))
+    _drone_rgb_only = (
+        band_map.red is not None
+        and band_map.green is not None
+        and band_map.blue is not None
+        and band_map.nir is None
+        and band_map.swir is None
+    )
+    if cfg is not None and (
+        cfg.get("mining_features_enabled", False) or _drone_rgb_only
+    ):
+        for mf in _mining_features(band_map, drone_rgb_only=_drone_rgb_only):
+            if mf not in feats:
+                feats.append(mf)
+    return feats
 
 
 def compute_features(
@@ -722,8 +961,10 @@ def compute_features(
     FeatureResult
     """
     # Callers that already hold a config dict pass it directly; load_config() is
-    # the fallback only when no dict is provided.  The .get() guard handles the
-    # edge case where a partial dict is passed without this key.
+    # the fallback only when no dict is provided.  We keep track of whether cfg
+    # was passed explicitly so hidden config defaults do not change the base
+    # feature stack unexpectedly across sessions.
+    cfg_provided = cfg is not None
     if cfg is None:
         cfg = load_config()
     corr_thresh = float(cfg.get("corr_flag_threshold", 0.95))
@@ -732,8 +973,28 @@ def compute_features(
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    possible_feats = _active_features(band_map)
+    possible_feats = list(_active_features(band_map))
+    _drone_rgb_only = (
+        band_map.red is not None
+        and band_map.green is not None
+        and band_map.blue is not None
+        and band_map.nir is None
+        and band_map.swir is None
+    )
+
+    mining_feats = _mining_features(band_map, drone_rgb_only=_drone_rgb_only)
+    include_optional_feats = cfg_provided and (
+        bool(cfg.get("mining_features_enabled", False)) or _drone_rgb_only
+    )
+    if include_optional_feats:
+        for mf in mining_feats:
+            if mf not in possible_feats:
+                possible_feats.append(mf)
+
     if enabled_features is not None:
+        for mf in mining_feats:
+            if mf in enabled_features and mf not in possible_feats:
+                possible_feats.append(mf)
         active_feats = [f for f in possible_feats if f in enabled_features]
     else:
         active_feats = possible_feats
@@ -753,10 +1014,26 @@ def compute_features(
     glcm_pad       = glcm_window // 2
 
     with rasterio.open(src_path) as ds:
-        src_profile = ds.profile.copy()
-        src_nodata  = ds.nodata
-        res         = float(abs(ds.transform.a))
-        n_tiles     = _count_windows(ds, block_size)
+        src_profile  = ds.profile.copy()
+        src_nodata   = ds.nodata
+        res          = float(abs(ds.transform.a))
+        n_tiles      = _count_windows(ds, block_size)
+        src_dtype    = ds.dtypes[0] if ds.count > 0 else "float32"
+
+    # Auto-scale uint8 drone bands to [0, 1] when configured
+    _drone_scale = bool(cfg.get("drone_rgb_scale_to_float", False))
+    _is_uint8    = (src_dtype == "uint8")
+    _scale_rgb   = _drone_scale and _is_uint8
+    if _is_uint8 and _drone_rgb_only and not _drone_scale:
+        import warnings
+        warnings.warn(
+            "Drone imagery appears to be uint8 (0–255) but "
+            "'drone_rgb_scale_to_float' is not enabled. "
+            "Set it to true in pipeline_config.yaml to auto-scale bands to [0,1] "
+            "before index computation.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     # Output nodata: inherit if valid (finite), otherwise use -9999.0
     if src_nodata is not None:
@@ -794,6 +1071,8 @@ def compute_features(
     with rasterio.open(src_path) as src, rasterio.open(out_path, "w", **out_profile) as dst:
         for window in iter_windows(src, block_size):
             raw = src.read(window=window).astype(np.float64)
+            if _scale_rgb:
+                raw = raw / 255.0
             H, W = raw.shape[1], raw.shape[2]
             total_pixels += H * W
 
@@ -889,7 +1168,8 @@ def compute_features(
                 "min": 0.0, "max": 0.0, "mean": 0.0, "std": 0.0, "valid_pct": 0.0
             }
 
-    # ── Texture summary ────────────────────────────────────────────────────────
+
+    # Texture summary (tile-level GLCM stats)
     texture_summary: Optional[dict[str, dict[str, float]]] = None
     if glcm_lists["contrast"]:
         texture_summary = {}
@@ -902,14 +1182,12 @@ def compute_features(
                 "max":  float(arr.max()),
             }
 
-    # ── Pass 2: streaming correlation ─────────────────────────────────────────
+    # Pass 2: streaming correlation matrix
     corr_matrix = _streaming_correlation(
         out_path, n_features, file_nodata, block_size
     )
 
-    # ── High-correlation pairs ─────────────────────────────────────────────────
-    # Strictly greater than (>) — pairs exactly at the threshold are not flagged.
-    # Matches "flag pairs with |r| above this" in pipeline_config.yaml.
+    # High-correlation pairs (strictly greater than threshold)
     high_corr: list[tuple[str, str, float]] = []
     for i in range(n_features):
         for j in range(i + 1, n_features):

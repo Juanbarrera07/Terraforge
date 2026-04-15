@@ -544,3 +544,196 @@ def validation_summary(results: dict[str, ValidationResult]) -> dict[str, int]:
     for r in results.values():
         counts[r.status] = counts.get(r.status, 0) + 1
     return counts
+
+
+# =============================================================================
+# Drone-specific validation
+# =============================================================================
+
+def check_drone_inputs(
+    raster_path: "str | Path",
+    cfg:         "dict | None" = None,
+) -> "list[ValidationResult]":
+    """
+    Validate a drone raster before feature extraction.
+
+    Checks
+    ------
+    1. Band count: must be >= 3 (RGB minimum).
+    2. Pixel resolution: warns if >= drone_pixel_res_threshold_m (likely satellite).
+    3. Band scaling: if pixel_res < threshold and dtype is uint8, warns unless
+       drone_rgb_scale_to_float is enabled in cfg.
+    4. File size: warns when > 2 GB with estimate for tile processing time.
+    5. Survey area: computes covered area in ha and returns it in the message.
+
+    Parameters
+    ----------
+    raster_path : Path to the raster to validate.
+    cfg         : Pipeline config dict.  Loads from yaml if None.
+
+    Returns
+    -------
+    List of ValidationResult — one per check.  Empty list = nothing to validate
+    (rasterio unavailable or file missing).
+    """
+    import math
+    from pathlib import Path as _Path
+
+    try:
+        import rasterio
+    except ImportError:
+        return []
+
+    if cfg is None:
+        from pipeline.config_loader import load_config
+        cfg = load_config()
+
+    raster_path = _Path(raster_path)
+    results: list[ValidationResult] = []
+
+    if not raster_path.exists():
+        results.append(ValidationResult(
+            check="drone_file_exists",
+            status="error",
+            message=f"Drone raster not found: {raster_path}",
+            blocks_pipeline=True,
+        ))
+        return results
+
+    try:
+        with rasterio.open(raster_path) as ds:
+            n_bands    = ds.count
+            dtype      = ds.dtypes[0] if n_bands > 0 else "unknown"
+            width      = ds.width
+            height     = ds.height
+            crs        = ds.crs
+            transform  = ds.transform
+            file_bytes = raster_path.stat().st_size
+
+        # Derive pixel resolution
+        if crs and crs.is_projected:
+            pixel_res_m = float(abs(transform.a))
+        else:
+            # Geographic CRS: approximate from degrees -> metres at equator
+            pixel_res_m = float(abs(transform.a)) * 111_320.0
+
+        drone_thresh = float(cfg.get("drone_pixel_res_threshold_m", 1.0))
+
+    except Exception as exc:
+        results.append(ValidationResult(
+            check="drone_open",
+            status="error",
+            message=f"Cannot open drone raster: {exc}",
+            blocks_pipeline=True,
+        ))
+        return results
+
+    # 1. Band count
+    if n_bands < 3:
+        results.append(ValidationResult(
+            check="drone_band_count",
+            status="error",
+            message=(
+                f"Drone raster has only {n_bands} band(s). "
+                "Minimum required is 3 (Red, Green, Blue)."
+            ),
+            blocks_pipeline=True,
+        ))
+    else:
+        results.append(ValidationResult(
+            check="drone_band_count",
+            status="ok",
+            message=f"Band count OK: {n_bands} band(s).",
+            blocks_pipeline=False,
+        ))
+
+    # 2. Resolution check
+    if pixel_res_m >= drone_thresh:
+        results.append(ValidationResult(
+            check="drone_resolution",
+            status="warn",
+            message=(
+                f"Pixel resolution {pixel_res_m:.2f} m >= {drone_thresh} m. "
+                "Drone mode expects sub-metre imagery. "
+                "If this is satellite data, use satellite mode instead."
+            ),
+            blocks_pipeline=False,
+        ))
+    else:
+        gsd_cm = pixel_res_m * 100.0
+        results.append(ValidationResult(
+            check="drone_resolution",
+            status="ok",
+            message=f"Drone GSD: {gsd_cm:.1f} cm/px ({pixel_res_m:.4f} m).",
+            blocks_pipeline=False,
+        ))
+
+    # 3. Band scaling (uint8 without scale flag)
+    if pixel_res_m < drone_thresh and dtype == "uint8":
+        scale_flag = bool(cfg.get("drone_rgb_scale_to_float", False))
+        if not scale_flag:
+            results.append(ValidationResult(
+                check="drone_band_scaling",
+                status="warn",
+                message=(
+                    "Bands appear to be uint8 (0-255). "
+                    "Spectral indices require float [0, 1]. "
+                    "Enable 'drone_rgb_scale_to_float: true' in pipeline_config.yaml "
+                    "or bands will not be scaled automatically."
+                ),
+                blocks_pipeline=False,
+            ))
+        else:
+            results.append(ValidationResult(
+                check="drone_band_scaling",
+                status="ok",
+                message="uint8 bands will be auto-scaled to [0, 1] (drone_rgb_scale_to_float: true).",
+                blocks_pipeline=False,
+            ))
+    else:
+        results.append(ValidationResult(
+            check="drone_band_scaling",
+            status="ok",
+            message=f"Band dtype: {dtype} — no scaling required.",
+            blocks_pipeline=False,
+        ))
+
+    # 4. File size + tiling estimate
+    size_gb = file_bytes / (1024 ** 3)
+    if size_gb > 2.0:
+        block = int(cfg.get("drone_block_size", 256))
+        n_tiles = math.ceil(height / block) * math.ceil(width / block)
+        est_sec = n_tiles * 0.05   # ~50 ms/tile rough estimate
+        results.append(ValidationResult(
+            check="drone_file_size",
+            status="warn",
+            message=(
+                f"Large file: {size_gb:.1f} GB ({n_tiles:,} tiles at {block}px). "
+                f"Estimated processing time: ~{est_sec/60:.0f} min. "
+                "Processing is fully windowed -- memory use stays constant."
+            ),
+            blocks_pipeline=False,
+        ))
+    else:
+        results.append(ValidationResult(
+            check="drone_file_size",
+            status="ok",
+            message=f"File size: {size_gb*1024:.0f} MB.",
+            blocks_pipeline=False,
+        ))
+
+    # 5. Survey area
+    if pixel_res_m > 0:
+        area_ha = (width * height * pixel_res_m ** 2) / 10_000.0
+        gsd_cm  = pixel_res_m * 100.0
+        results.append(ValidationResult(
+            check="drone_survey_area",
+            status="ok",
+            message=(
+                f"Survey area: {area_ha:.2f} ha "
+                f"({width} x {height} px at {gsd_cm:.1f} cm/px GSD)."
+            ),
+            blocks_pipeline=False,
+        ))
+
+    return results

@@ -20,6 +20,7 @@ is stored in session state, not the pixel data.
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -415,8 +416,14 @@ def render() -> None:
     if st.button("▶ Extract Samples → Train → Predict", type="primary",
                  key="run_classification"):
         try:
+            # Status panel — updated after each step
+            status = st.empty()
+            status.markdown(
+                "⏳ Step 1/3: Extracting samples | ⏳ Step 2/3: Training | ⏳ Step 3/3: Predicting"
+            )
+
             # Step 1 — extract samples (local arrays, freed after training)
-            with st.spinner("Extracting training samples…"):
+            with st.spinner("Step 1/3 — Extracting training samples…"):
                 if training_format.startswith("Shapefile"):
                     X, y, class_summary = extract_from_shapefile(
                         shp_path                = training_path,
@@ -435,6 +442,10 @@ def render() -> None:
                         random_state = 42,
                     )
                     session.set_("class_column", None)
+
+            status.markdown(
+                "✅ Step 1/3: Samples extracted | ⏳ Step 2/3: Training | ⏳ Step 3/3: Predicting"
+            )
             st.info(
                 f"Samples extracted: **{len(y):,}**  |  "
                 f"Classes: {sorted(set(y.tolist()))}",
@@ -444,8 +455,14 @@ def render() -> None:
                 st.dataframe(class_summary, use_container_width=True, hide_index=True)
 
             # Step 2 — train (X and y stay on the stack, not in session)
+            train_info = st.info(
+                f"Training {model_type} — {k_folds}-fold CV on {len(y):,} samples.  "
+                "This step has no tile-level progress (CV runs in memory). "
+                "Expected time: depends on dataset size.",
+                icon="⏳",
+            )
             with st.spinner(
-                f"Training {model_type} with {k_folds}-fold CV…"
+                f"Step 2/3 — Training {model_type} with {k_folds}-fold CV…"
             ):
                 result = train_model(
                     X, y,
@@ -455,9 +472,16 @@ def render() -> None:
                 )
             # Free training arrays immediately after model is built
             del X, y
+            train_info.empty()
+
+            status.markdown(
+                "✅ Step 1/3: Samples extracted | ✅ Step 2/3: Training complete | ⏳ Step 3/3: Predicting"
+            )
 
             # Step 3 — predict raster + companion confidence map (windowed)
-            with st.spinner("Predicting classification + confidence raster…"):
+            st.markdown("**Step 3/3 — Classifying raster (windowed)**")
+            t0_pred = time.perf_counter()
+            with st.spinner("Step 3/3 — Predicting classification + confidence raster…"):
                 predict_raster(
                     model            = result.model,
                     feature_path     = feature_path,
@@ -465,6 +489,10 @@ def render() -> None:
                     feature_names    = feat_names,
                     confidence_path  = out_confidence,
                 )
+            pred_elapsed = time.perf_counter() - t0_pred
+
+            status.markdown("✅ Step 1/3 ✅ Step 2/3 ✅ Step 3/3: All done")
+            st.caption(f"Classification complete — {pred_elapsed:.1f}s")
 
             # Persist result, classified path, and confidence path
             session.set_("model",      result)

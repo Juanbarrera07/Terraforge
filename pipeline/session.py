@@ -34,6 +34,7 @@ PIPELINE_STAGES: list[str] = [
 # None means "not yet populated"; callers must check before use.
 _DEFAULTS: dict[str, Any] = {
     "run_id": None,
+    "config_snapshot_logged_run_id": None,  # str | None - last run with a config snapshot written
     "raw_data": None,               # dict[str, LayerDict]  — from ingest.py
     "validation_results": None,     # dict[str, ValidationResult] — from validate.py
     "preprocessed": None,           # dict  — after preprocess.py
@@ -58,6 +59,11 @@ _DEFAULTS: dict[str, Any] = {
     "chain_log":            None,   # list[str] — accumulated progress messages
     "chain_start_time":     None,   # float — time.time() at chain start
     "chain_cancel_event":   None,   # threading.Event | None
+    # ── Post-processing UI caches ─────────────────────────────────────────────
+    "_chain_result":              None,  # dict — last chain output paths
+    "_confidence_stats_cache":    None,  # dict — cached confidence statistics
+    "_chain_step_plan":           None,  # list[tuple[str,str]] — dynamic step plan
+    "quality_gate_results":       None,  # list[QualityGateResult]
 }
 
 
@@ -134,6 +140,7 @@ def new_run() -> str:
     st.session_state.classified = None
     st.session_state.accuracy = None
     st.session_state.audit_log = []
+    st.session_state.config_snapshot_logged_run_id = None
     st.session_state.pipeline_unlocked = {"ingestion"}
     st.session_state.previous_class_areas = None
     st.session_state.coreg_results        = None
@@ -142,11 +149,15 @@ def new_run() -> str:
     st.session_state.training_source      = None
     st.session_state.training_path        = None
     st.session_state.class_column         = None
-    st.session_state.chain_thread         = None
-    st.session_state.chain_queue          = None
-    st.session_state.chain_log            = None
-    st.session_state.chain_start_time     = None
-    st.session_state.chain_cancel_event   = None
+    st.session_state.chain_thread             = None
+    st.session_state.chain_queue              = None
+    st.session_state.chain_log                = None
+    st.session_state.chain_start_time         = None
+    st.session_state.chain_cancel_event       = None
+    st.session_state._chain_result            = None
+    st.session_state._confidence_stats_cache  = None
+    st.session_state._chain_step_plan         = None
+    st.session_state.quality_gate_results     = None
 
     # Clean previous run's tmp — best-effort, never blocks the new run.
     if old_run_id and cfg:

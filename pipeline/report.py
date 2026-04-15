@@ -753,37 +753,500 @@ def _section_audit_log(
             "See the full audit_log.json for the complete history.)",
             styles["caption"],
         ))
+# Mining-specific additions
+# ============================================================================
+
+# Mining class colours (hex) — used for classification map legend
+_MINING_COLOURS: dict[int, str] = {
+    # Pit wall
+    1: "#8B4513",  # Exposed Fresh Rock — brown
+    2: "#DAA520",  # Weathered/Oxidised — goldenrod
+    3: "#DC143C",  # Instability Zone — crimson (risk)
+    4: "#228B22",  # Vegetation — forest green
+    5: "#4169E1",  # Water/Seepage — royal blue
+    # TSF extras
+    6: "#A0522D",  # Seepage/Discolouration
+}
+
+_GOLD = colors.HexColor("#C8860A")
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+def _raster_preview_image(
+    raster_path,
+    tmp_png: Path,
+    discrete: bool = True,
+    class_colours: dict | None = None,
+) -> Path | None:
+    """
+    Render a small preview PNG from a GeoTIFF using matplotlib.
+    Returns the PNG path or None if rendering fails.
+    """
+    try:
+        import numpy as np
+        import rasterio
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+        from matplotlib.patches import Patch
+
+        with rasterio.open(raster_path) as src:
+            data = src.read(1)
+            nodata = src.nodata
+
+        if nodata is not None:
+            data = data.astype(float)
+            data[data == nodata] = np.nan
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+
+        if discrete and class_colours:
+            valid_classes = sorted(
+                c for c in class_colours if np.any(data == c)
+            )
+            bounds = [c - 0.5 for c in valid_classes] + [valid_classes[-1] + 0.5]
+            hex_list = [class_colours[c] for c in valid_classes]
+            cmap = mcolors.ListedColormap(hex_list)
+            norm = mcolors.BoundaryNorm(bounds, cmap.N)
+            ax.imshow(data, cmap=cmap, norm=norm, interpolation="nearest")
+        else:
+            finite = data[np.isfinite(data)]
+            vmin = float(np.nanpercentile(finite, 2))
+            vmax = float(np.nanpercentile(finite, 98))
+            ax.imshow(data, cmap="RdYlGn", vmin=vmin, vmax=vmax, interpolation="bilinear")
+
+        ax.axis("off")
+        ax.set_facecolor("#1B2A4A")
+        fig.patch.set_facecolor("#1B2A4A")
+        plt.tight_layout(pad=0)
+        fig.savefig(tmp_png, dpi=120, bbox_inches="tight", facecolor="#1B2A4A")
+        plt.close(fig)
+        return tmp_png
+    except Exception:
+        return None
+
+
+def _section_mining_cover(
+    styles: dict,
+    run_id: str,
+    site_name: str,
+    operator: str,
+    survey_type: str,
+    mode: str,
+    generated_at: str,
+    story: list,
+) -> None:
+    from reportlab.platypus import HRFlowable
+
+    # Coloured header bar
+    story.append(Spacer(1, 0.5 * cm))
+
+    # Logo placeholder with mining colour
+    logo = _LogoPlaceholder()
+    story.append(logo)
+    story.append(Spacer(1, 0.8 * cm))
+
+    # Title
+    mode_title = "Open Pit Wall Assessment" if mode == "pit_wall" else "Tailings Storage Facility Survey"
+    story.append(Paragraph("Geospatial Material Classification Report", styles["cover_title"]))
+    story.append(Paragraph(mode_title, styles["cover_sub"]))
+    story.append(Spacer(1, 0.6 * cm))
+    story.append(HRFlowable(width="100%", thickness=2, color=_GOLD))
+    story.append(Spacer(1, 0.6 * cm))
+
+    cover_data = [
+        ("Site Name",    site_name),
+        ("Operator",     operator or "N/A"),
+        ("Date",         generated_at[:10]),
+        ("Run ID",       run_id),
+        ("Survey Type",  survey_type),
+        ("Mode",         mode.replace("_", " ").title()),
+    ]
+    t = Table(
+        [[Paragraph(k, styles["body"]), Paragraph(v, styles["body"])]
+         for k, v in cover_data],
+        colWidths=[5 * cm, 11 * cm],
+    )
+    t.setStyle(TableStyle([
+        ("FONTNAME",     (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTSIZE",     (0, 0), (-1, -1), 9),
+        ("TOPPADDING",   (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 4),
+        ("ROWBACKGROUNDS",(0, 0), (-1, -1), ["#F8F9FA", "#FFFFFF"]),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 1.0 * cm))
+    story.append(HRFlowable(width="100%", thickness=1, color=_NAVY))
+    story.append(Spacer(1, 0.4 * cm))
+
+    disclaimer = (
+        "This report is produced by an automated geospatial pipeline. "
+        "Results should be reviewed by a qualified geotechnical engineer "
+        "before operational decisions are made."
+    )
+    story.append(Paragraph(f"<b>Disclaimer:</b> {disclaimer}", styles["caption"]))
+
+
+def _section_mining_executive_summary(
+    styles: dict,
+    clf_result,
+    area_result,
+    class_defs: dict,
+    cfg: dict,
+    story: list,
+) -> None:
+    from reportlab.platypus import HRFlowable
+
+    story.append(Paragraph("1. Executive Summary", styles["section_h1"]))
+
+    oa      = getattr(clf_result, "oa", None)
+    kappa   = getattr(clf_result, "kappa", None)
+    mf1     = getattr(clf_result, "minority_f1", None)
+    passed  = getattr(clf_result, "gate_passed", None)
+    msg     = getattr(clf_result, "gate_message", "")
+
+    # Gate badge row
+    gate_label = "PASS" if passed else "FAIL"
+    gate_col   = _GREEN if passed else _RED
+
+    kv_rows = [
+        ("Overall Accuracy (OA)",  f"{oa:.4f}" if oa is not None else "N/A"),
+        ("Cohen's Kappa",           f"{kappa:.4f}" if kappa is not None else "N/A"),
+        ("Minority Class F1",       f"{mf1:.4f}" if mf1 is not None else "N/A"),
+        ("Quality Gate",            gate_label),
+        ("Model type",              getattr(clf_result, "model_type", "N/A")),
+        ("SMOTE applied",           str(getattr(clf_result, "smote_applied", "N/A"))),
+    ]
+    t = Table(
+        [[Paragraph(k, styles["body"]), Paragraph(v, styles["body"])]
+         for k, v in kv_rows],
+        colWidths=[7 * cm, 9 * cm],
+    )
+    ts = TableStyle([
+        ("FONTNAME",      (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTSIZE",      (0, 0), (-1, -1), 9),
+        ("TOPPADDING",    (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("ROWBACKGROUNDS",(0, 0), (-1, -1), ["#F8F9FA", "#FFFFFF"]),
+    ])
+    # Colour gate row
+    gate_row_idx = 3
+    ts.add("TEXTCOLOR", (1, gate_row_idx), (1, gate_row_idx), gate_col)
+    ts.add("FONTNAME",  (1, gate_row_idx), (1, gate_row_idx), "Helvetica-Bold")
+    t.setStyle(ts)
+    story.append(t)
+    story.append(Spacer(1, 0.3 * cm))
+    if msg:
+        story.append(Paragraph(f"Gate: {msg}", styles["caption"]))
+    story.append(Spacer(1, 0.3 * cm))
+
+    # Class area summary table
+    if area_result is not None:
+        areas_ha  = getattr(area_result, "areas_ha",   {}) or {}
+        areas_pct = getattr(area_result, "areas_pct",  {}) or {}
+        total_ha  = getattr(area_result, "total_area_ha", None)
+
+        header = ["Class", "Name", "Area (ha)", "Area (%)"]
+        rows   = [header]
+        for cls_id in sorted(areas_ha.keys()):
+            ha  = areas_ha.get(cls_id, 0.0)
+            pct = areas_pct.get(cls_id, 0.0)
+            name = class_defs.get(str(cls_id), class_defs.get(cls_id, f"Class {cls_id}"))
+            rows.append([str(cls_id), str(name), f"{ha:.2f}", f"{pct:.1f}%"])
+        if total_ha:
+            rows.append(["", "TOTAL", f"{total_ha:.2f}", "100.0%"])
+
+        col_w = [2*cm, 8*cm, 3*cm, 3*cm]
+        tbl = Table(rows, colWidths=col_w)
+        tbl.setStyle(_HEADER_STYLE)
+        story.append(tbl)
+        story.append(Spacer(1, 0.3 * cm))
+
+    # Auto-generated executive paragraph
+    if oa is not None and area_result is not None:
+        areas_ha  = getattr(area_result, "areas_ha",   {}) or {}
+        areas_pct = getattr(area_result, "areas_pct",  {}) or {}
+        total_ha  = getattr(area_result, "total_area_ha", None) or 0.0
+        drift_pct = cfg.get("drift_alert_pct", 20)
+        n_classes = len(areas_ha)
+        dominant_cls = max(areas_pct, key=areas_pct.get) if areas_pct else "N/A"
+        dominant_pct = areas_pct.get(dominant_cls, 0.0)
+        dominant_name = class_defs.get(str(dominant_cls), f"Class {dominant_cls}")
+        para = (
+            f"Classification achieved an Overall Accuracy of <b>{oa:.1%}</b> "
+            f"(Kappa: <b>{kappa:.3f}</b>) across <b>{n_classes}</b> material "
+            f"classes covering <b>{total_ha:.1f} ha</b> of surveyed area. "
+            f"The dominant class is <i>{dominant_name}</i> at "
+            f"<b>{dominant_pct:.1f}%</b> of the surveyed area. "
+            f"Drift monitoring threshold is set at {drift_pct}% per class."
+        )
+        story.append(Paragraph(para, styles["body"]))
+
+
+def _section_mining_classification_map(
+    styles: dict,
+    cog_path,
+    class_defs: dict,
+    area_result,
+    story: list,
+) -> None:
+    import tempfile, os
+    story.append(Paragraph("2. Material Classification Map", styles["section_h1"]))
+
+    # Preview image
+    if cog_path and Path(cog_path).exists():
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            tmp_png = Path(f.name)
+
+        preview = _raster_preview_image(
+            cog_path, tmp_png, discrete=True,
+            class_colours=_MINING_COLOURS,
+        )
+        if preview and preview.exists():
+            from reportlab.platypus import Image as RLImage
+            avail_w = PAGE_W - 2 * MARGIN
+            story.append(RLImage(str(preview), width=avail_w, height=avail_w * 0.6))
+            story.append(Spacer(1, 0.2 * cm))
+            try:
+                os.unlink(tmp_png)
+            except OSError:
+                pass
+        else:
+            story.append(Paragraph(
+                "Classification map preview unavailable (matplotlib not installed).",
+                styles["caption"],
+            ))
+    else:
+        story.append(Paragraph("Classified raster not available.", styles["caption"]))
+
+    # Legend table
+    areas_ha  = getattr(area_result, "areas_ha",   {}) or {} if area_result else {}
+    areas_pct = getattr(area_result, "areas_pct",  {}) or {} if area_result else {}
+
+    from reportlab.lib import colors as rl_colors
+    from reportlab.platypus import Table as RLTable
+
+    header = ["Colour", "Class ID", "Class Name", "Area (ha)", "Area (%)"]
+    rows   = [header]
+    for cls_id in sorted(class_defs.keys()):
+        hex_c = _MINING_COLOURS.get(int(cls_id) if str(cls_id).isdigit() else 0, "#AAAAAA")
+        name  = class_defs[cls_id]
+        ha    = areas_ha.get(int(cls_id), areas_ha.get(str(cls_id), 0.0))
+        pct   = areas_pct.get(int(cls_id), areas_pct.get(str(cls_id), 0.0))
+        rows.append(["", str(cls_id), str(name), f"{ha:.2f}", f"{pct:.1f}%"])
+
+    col_w = [1.5*cm, 2*cm, 7*cm, 3*cm, 2.5*cm]
+    tbl   = Table(rows, colWidths=col_w)
+    base_style = list(_HEADER_STYLE.getCommands())
+    # Colour swatches in first column (body rows)
+    for i, cls_id in enumerate(sorted(class_defs.keys()), start=1):
+        hex_c = _MINING_COLOURS.get(int(cls_id) if str(cls_id).isdigit() else 0, "#AAAAAA")
+        base_style.append(("BACKGROUND", (0, i), (0, i), rl_colors.HexColor(hex_c)))
+    tbl.setStyle(TableStyle(base_style))
+    story.append(tbl)
+
+
+def _section_mining_confidence(
+    styles: dict,
+    confidence_path,
+    story: list,
+) -> None:
+    import tempfile, os
+    story.append(Paragraph("3. Confidence Analysis", styles["section_h1"]))
+
+    if confidence_path is None or not Path(confidence_path).exists():
+        story.append(Paragraph("Confidence raster not available for this run.", styles["body"]))
+        return
+
+    # Compute percentile stats
+    stats = compute_confidence_stats(Path(confidence_path), threshold=0.60)
+
+    if stats:
+        kv = [
+            ("Mean confidence",       f"{stats.get('mean', 0):.3f}"),
+            ("Median (p50)",          f"{stats.get('p50', 0):.3f}"),
+            ("p05 / p95",             f"{stats.get('p05', 0):.3f} / {stats.get('p95', 0):.3f}"),
+            ("Low confidence < 0.60", f"{stats.get('low_conf_pct', 0):.1f}% of pixels"),
+        ]
+        story.append(_two_col_table(kv))
+        story.append(Spacer(1, 0.3 * cm))
+        low_pct = stats.get("low_conf_pct", 0)
+        if low_pct > 15:
+            story.append(Paragraph(
+                f"<b>Note:</b> {low_pct:.1f}% of pixels have confidence < 0.60. "
+                "These areas require field verification.",
+                styles["caption"],
+            ))
+
+    # Confidence map preview
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        tmp_png = Path(f.name)
+    preview = _raster_preview_image(confidence_path, tmp_png, discrete=False)
+    if preview and preview.exists():
+        from reportlab.platypus import Image as RLImage
+        avail_w = PAGE_W - 2 * MARGIN
+        story.append(RLImage(str(preview), width=avail_w, height=avail_w * 0.5))
+        story.append(Paragraph(
+            "Confidence map (RdYlGn): green = high confidence, red = low confidence.",
+            styles["caption"],
+        ))
+        try:
+            os.unlink(tmp_png)
+        except OSError:
+            pass
+
+
+def _section_mining_methodology(
+    styles: dict,
+    clf_result,
+    feat_names: list,
+    class_defs: dict,
+    cfg: dict,
+    story: list,
+) -> None:
+    story.append(Paragraph("5. Methodology", styles["section_h1"]))
+
+    # Model info
+    model_type = getattr(clf_result, "model_type", "N/A")
+    k_folds    = cfg.get("default_k_folds", 5)
+    smote      = getattr(clf_result, "smote_applied", False)
+    cv_scores  = getattr(clf_result, "cv_scores", [])
+
+    kv = [
+        ("Classifier",           model_type),
+        ("Cross-validation",     f"{k_folds}-fold stratified"),
+        ("SMOTE resampling",     str(smote)),
+        ("CV fold OA scores",    ", ".join(f"{s:.3f}" for s in cv_scores) or "N/A"),
+        ("Min mapping unit",     f"{cfg.get('min_mapping_unit_ha', 0.5)} ha"),
+        ("Coreg RMSE threshold", f"{cfg.get('coreg_rmse_threshold', 0.5)} px"),
+        ("OA threshold",         f"{cfg.get('min_oa_threshold', 0.80):.0%}"),
+        ("Minority F1 threshold",f"{cfg.get('min_minority_f1', 0.70):.0%}"),
+    ]
+    story.append(_two_col_table(kv))
+    story.append(Spacer(1, 0.3 * cm))
+
+    # Feature list
+    if feat_names:
+        story.append(Paragraph("<b>Features computed:</b>", styles["body"]))
+        feat_str = ", ".join(feat_names)
+        story.append(Paragraph(feat_str, styles["caption"]))
+        story.append(Spacer(1, 0.2 * cm))
+
+    # Feature importances
+    fi = getattr(clf_result, "feature_importances", None)
+    if fi:
+        story.append(Paragraph("<b>Top feature importances:</b>", styles["body"]))
+        top = sorted(fi.items(), key=lambda x: x[1], reverse=True)[:10]
+        rows = [["Feature", "Importance"]]
+        for name, imp in top:
+            rows.append([name, f"{imp:.4f}"])
+        col_w = [9 * cm, 7 * cm]
+        tbl = Table(rows, colWidths=col_w)
+        tbl.setStyle(_HEADER_STYLE)
+        story.append(tbl)
+
+
+def _section_mining_audit(
+    styles: dict,
+    run_id: str,
+    audit_path,
+    story: list,
+) -> None:
+    story.append(Paragraph("6. Audit Trail", styles["section_h1"]))
+
+    # Load audit log from JSON if provided, else fall back to get_log
+    log: list[dict] = []
+    if audit_path and Path(audit_path).exists():
+        import json
+        try:
+            log = json.loads(Path(audit_path).read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    if not log:
+        from pipeline.audit import get_log
+        log = get_log(run_id)
+
+    if not log:
+        story.append(Paragraph("No audit events recorded for this run.", styles["body"]))
+        return
+
+    header = ["Timestamp", "Stage", "Decision"]
+    rows   = [header]
+    for entry in log[:MAX_AUDIT_ROWS]:
+        ts       = entry.get("timestamp", "")[:19].replace("T", " ")
+        stage    = entry.get("event_type", "")
+        decision = entry.get("decision") or str(entry.get("details", {}).get("stage", ""))
+        rows.append([ts, stage, decision or "—"])
+
+    col_w = [5 * cm, 4 * cm, 7 * cm]
+    tbl = Table(rows, colWidths=col_w)
+    tbl.setStyle(_HEADER_STYLE)
+    story.append(tbl)
+
+    story.append(Spacer(1, 0.3 * cm))
+    story.append(Paragraph(
+        f"This pipeline run is fully traceable. "
+        f"The complete audit log is available in <b>{run_id}_audit_log.json</b>. "
+        f"Reproduce this analysis using TerraForge Mining Intelligence "
+        f"with run ID <b>{run_id}</b>.",
+        styles["caption"],
+    ))
+
 
 def generate_report(
-    run_id:        str,
-    session_data:  dict,
-    out_path:      Path,
+    run_id: str,
+    out_path,
+    session_data: dict | None = None,
     operator_name: str = "",
+    # Mining-specific kwargs (used when session_data is None)
+    site_name: str = "",
+    operator: str = "",
+    survey_type: str = "Satellite",
+    mode: str = "pit_wall",
+    cog_path=None,
+    confidence_path=None,
+    classification_result=None,
+    area_result=None,
+    class_defs: dict | None = None,
+    cfg: dict | None = None,
+    audit_path=None,
 ) -> Path:
     """
-    Generate a multi-section technical PDF report for a TerraForge run.
+    Generate a TerraForge mining PDF report.
 
-    Parameters
-    ----------
-    run_id        : Run identifier (e.g. "A1B2C3D4").
-    session_data  : Shallow snapshot of pipeline session state.  All keys are
-                    optional; missing values render as "N/A" (Not Available).
-    out_path      : Destination path for the PDF (parent must exist or will be
-                    created).
-    operator_name : Name of the operator signing the report.
+    Supports two call styles:
 
-    Returns
-    -------
-    Path  — resolved path to the written PDF file.
+    Legacy (Streamlit app):
+        generate_report(run_id, session_data, out_path, operator_name="")
+
+    Mining demo:
+        generate_report(run_id, out_path, site_name=..., operator=...,
+                        survey_type=..., mode=..., cog_path=..., ...)
+
+    All parameters are optional; missing values render as 'N/A'.
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     styles       = _build_styles()
+    _cfg         = cfg or {}
+
+    # ── Determine which rendering path to use ─────────────────────────────────
+    _mining_mode = (session_data is None)
+
+    _site_name   = site_name or (session_data or {}).get("site_name", "")
+    _operator    = operator or operator_name or ""
+    _survey_type = survey_type
+    _mode        = mode
+    _cog_path    = cog_path
+    _conf_path   = confidence_path
+    _clf         = classification_result
+    _area        = area_result
+    _class_defs  = class_defs or {}
+
+    footer_label = _site_name or "TerraForge Mining Intelligence"
     footer_cb    = _make_footer_cb(run_id, generated_at)
 
     # ── Document template ─────────────────────────────────────────────────────
@@ -793,9 +1256,8 @@ def generate_report(
         leftMargin=MARGIN,
         rightMargin=MARGIN,
         topMargin=MARGIN,
-        bottomMargin=2.5 * cm,   # leave room for footer
+        bottomMargin=2.5 * cm,
     )
-
     frame = Frame(
         MARGIN, 2.5 * cm,
         PAGE_W - 2 * MARGIN,
@@ -805,36 +1267,69 @@ def generate_report(
     template = PageTemplate(id="main", frames=[frame], onPage=footer_cb)
     doc.addPageTemplates([template])
 
-    # ── Story ─────────────────────────────────────────────────────────────────
     from reportlab.platypus import PageBreak
-
     story: list = []
 
-    _section_cover(styles, run_id, operator_name, generated_at, story)
-    story.append(PageBreak())
+    if _mining_mode:
+        # ── Mining demo report ────────────────────────────────────────────────
+        _section_mining_cover(
+            styles, run_id, _site_name, _operator, _survey_type, _mode,
+            generated_at, story,
+        )
+        story.append(PageBreak())
 
-    _section_executive_summary(styles, session_data, story)
-    story.append(PageBreak())
+        _section_mining_executive_summary(
+            styles, _clf, _area, _class_defs, _cfg, story,
+        )
+        story.append(PageBreak())
 
-    _section_classification(styles, session_data, story)
-    story.append(PageBreak())
+        _section_mining_classification_map(
+            styles, _cog_path, _class_defs, _area, story,
+        )
+        story.append(PageBreak())
 
-    _section_confidence_stats(styles, session_data, story)
-    story.append(PageBreak())
+        _section_mining_confidence(styles, _conf_path, story)
+        story.append(PageBreak())
 
-    _section_postprocess_params(styles, session_data, story)
-    story.append(PageBreak())
+        # Change detection placeholder (no reference available in standalone demo)
+        story.append(Paragraph("4. Change Detection", styles["section_h1"]))
+        story.append(Paragraph(
+            "No reference survey is available for this run. "
+            "Change detection requires a prior classified raster to compute "
+            "per-class area deltas. "
+            "Re-run with --reference-dir to enable drift monitoring.",
+            styles["body"],
+        ))
+        story.append(PageBreak())
 
-    _section_quality_gate(styles, session_data, story)
-    story.append(PageBreak())
+        _section_mining_methodology(
+            styles, _clf,
+            getattr(_clf, "feature_names", []) if _clf else [],
+            _class_defs, _cfg, story,
+        )
+        story.append(PageBreak())
 
-    _section_class_areas(styles, session_data, story)
-    story.append(PageBreak())
+        _section_mining_audit(styles, run_id, audit_path, story)
 
-    _section_preprocessing(styles, session_data, story)
-    story.append(PageBreak())
-
-    _section_audit_log(styles, run_id, story)
+    else:
+        # ── Legacy session_data report (Streamlit app) ────────────────────────
+        _section_cover(styles, run_id, _operator, generated_at, story)
+        story.append(PageBreak())
+        _section_executive_summary(styles, session_data, story)
+        story.append(PageBreak())
+        _section_classification(styles, session_data, story)
+        story.append(PageBreak())
+        _section_confidence_stats(styles, session_data, story)
+        story.append(PageBreak())
+        _section_postprocess_params(styles, session_data, story)
+        story.append(PageBreak())
+        _section_quality_gate(styles, session_data, story)
+        story.append(PageBreak())
+        _section_class_areas(styles, session_data, story)
+        story.append(PageBreak())
+        _section_preprocessing(styles, session_data, story)
+        story.append(PageBreak())
+        _section_audit_log(styles, run_id, story)
 
     doc.build(story)
     return out_path.resolve()

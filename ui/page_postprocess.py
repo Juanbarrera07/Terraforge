@@ -33,9 +33,11 @@ from pipeline.postprocess import (
     DriftResult,
     QualityGateResult,
     assess_accuracy_from_points,
+    build_chain_step_plan,
     check_drift,
     compute_class_areas,
     confidence_filter,
+    drone_adaptive_params,
     estimate_chain_time,
     has_gate_failures,
     median_smooth,
@@ -47,8 +49,8 @@ from pipeline.postprocess import (
 from pipeline.raster_io import get_meta, iter_windows
 from ui._helpers import gate_metric, run_output_dir, save_upload
 
-# Step names and display labels for the chain
-_CHAIN_STEPS: list[tuple[str, str]] = [
+# Fallback step names for satellite mode (overridden dynamically)
+_CHAIN_STEPS_DEFAULT: list[tuple[str, str]] = [
     ("confidence_filter",    "Confidence filter"),
     ("median_smooth",        "Median smooth"),
     ("morphological_close",  "Morphological close"),
@@ -265,9 +267,9 @@ def render() -> None:
     # ── Auto: Post-Processing Chain ───────────────────────────────────────
     st.subheader("▶ Post-Processing Chain (Express)")
     st.caption(
-        "Runs all four steps in sequence: **confidence filter → median smooth → "
-        "morphological close → sieve MMU filter**.  "
-        "Parameters are read from the pipeline config."
+        "Runs the post-processing chain in sequence. **Satellite mode** uses "
+        "4 fixed steps; **drone mode** adapts the number and size of smoothing "
+        "passes to the pixel resolution. Parameters are read from the pipeline config."
     )
 
     confidence_path_str: str | None = session.get("confidence")
@@ -284,9 +286,26 @@ def render() -> None:
         conf_threshold  = float(cfg.get("confidence_threshold", 0.6))
 
         # ── Confidence map statistics (windowed, no full read) ────────────
-        with st.expander("📊 Confidence Map Statistics", expanded=True):
+        # Cached in session state — not recomputed on every polling rerun.
+        _cstats_cached = session.get("_confidence_stats_cache")
+        _cstats_key    = str(confidence_path)
+        if (
+            _cstats_cached is None
+            or _cstats_cached.get("_path_key") != _cstats_key
+        ):
             try:
-                cstats = _confidence_stats(confidence_path, conf_threshold)
+                _cstats_val = _confidence_stats(confidence_path, conf_threshold)
+                _cstats_val["_path_key"] = _cstats_key
+                session.set_("_confidence_stats_cache", _cstats_val)
+                _cstats_cached = _cstats_val
+            except Exception as exc:
+                _cstats_cached = None
+                st.warning(f"Could not compute confidence statistics: {exc}",
+                           icon="⚠️")
+
+        with st.expander("📊 Confidence Map Statistics", expanded=True):
+            if _cstats_cached:
+                cstats = _cstats_cached
                 cs1, cs2, cs3, cs4 = st.columns(4)
                 with cs1:
                     st.metric("Mean confidence", f"{cstats['mean']:.3f}")
@@ -299,9 +318,6 @@ def render() -> None:
                               help=f"Confidence threshold: {conf_threshold}")
                 with cs4:
                     st.metric("% below threshold", f"{cstats['pct_below']:.1f}%")
-            except Exception as exc:
-                st.warning(f"Could not compute confidence statistics: {exc}",
-                           icon="⚠️")
 
         chain_out_dir = run_output_dir(cfg, run_id, "postprocessing")
 
@@ -327,27 +343,55 @@ def render() -> None:
                 st.info(
                     f"**Drone mode** will be auto-enabled "
                     f"(pixel_res_m = {pixel_res_m:.3f} m < {drone_threshold} m). "
-                    "Parameters will be adapted for high-resolution imagery.",
+                    "Parameters are adaptively computed for high-resolution imagery.",
                     icon="🛸",
                 )
+                # Show adaptive parameters computed for this resolution
+                try:
+                    _dp = drone_adaptive_params(pixel_res_m, cfg)
+                    st.markdown("**Adaptive smoothing plan**")
+                    _sp_rows = []
+                    for _sp in _dp["smooth_passes"]:
+                        _sp_rows.append({
+                            "Pass":      _sp["label"],
+                            "Kernel":    f"{_sp['kernel']}×{_sp['kernel']}",
+                            "Target":    f"{_sp['target_m']:.1f} m",
+                            "Method":    _sp["method"],
+                        })
+                    st.dataframe(pd.DataFrame(_sp_rows),
+                                 use_container_width=True, hide_index=True)
+                    _ad_rows = [
+                        {"Parameter": "Morpho kernel",    "Value": str(_dp["morpho_kernel"])},
+                        {"Parameter": "Morpho iterations", "Value": str(_dp["morpho_iters"])},
+                        {"Parameter": "Conf filter size",  "Value": str(_dp["conf_filter_size"])},
+                        {"Parameter": "Sieve min px",      "Value": str(_dp["sieve_min_px"])},
+                        {"Parameter": "Skip confidence",   "Value": str(_dp["skip_confidence"])},
+                    ]
+                    st.dataframe(pd.DataFrame(_ad_rows),
+                                 use_container_width=True, hide_index=True)
+                except Exception:
+                    pass  # best-effort display
             else:
                 st.caption(
                     f"pixel_res_m = {pixel_res_m:.2f} m — "
                     f"standard mode (drone mode threshold: {drone_threshold} m)"
                 )
 
-            # Time estimate table
+            # Time estimate table (best-effort)
             try:
                 _res_for_est = pixel_res_m if pixel_res_m else 10.0
                 _estimates   = estimate_chain_time(classified_path, cfg, _res_for_est)
                 _warn_msg    = _estimates.pop("warning", None)
+                _dyn_steps   = build_chain_step_plan(_res_for_est, cfg)
                 _est_rows = [
-                    {"Step": _CHAIN_STEPS[i][1],
-                     "Estimated time": f"~{_estimates[k]:.0f}s"}
-                    for i, (k, _) in enumerate(_CHAIN_STEPS)
-                    if k in _estimates
+                    {"Step": slabel,
+                     "Estimated time": f"~{_estimates[skey]:.0f}s"}
+                    for skey, slabel in _dyn_steps
+                    if skey in _estimates
                 ]
-                _total_s = sum(_estimates.values())
+                _num_vals = {v for v in _estimates.values()
+                             if isinstance(v, (int, float))}
+                _total_s = sum(_num_vals)
                 _est_rows.append({"Step": "**TOTAL**",
                                   "Estimated time": f"**~{_total_s/60:.1f} min**"})
                 st.markdown("**Estimated processing time**")
@@ -365,12 +409,19 @@ def render() -> None:
 
         # ── Launch button (only if not running) ───────────────────────────
         if not _chain_running:
+            # Build dynamic step plan based on pixel resolution
+            _dynamic_steps = build_chain_step_plan(pixel_res_m, cfg)
+
             if st.button("▶ Run Post-Processing Chain", key="run_chain",
                          type="primary"):
                 _q  = queue.Queue()
                 _ev = threading.Event()
 
-                def _run_chain_in_thread(
+                # Capture values so the thread closure gets correct references.
+                _pixel_res_capture = pixel_res_m
+                _step_plan_capture = list(_dynamic_steps)
+
+                def _run_chain_in_thread(  # redefine to inject pixel_res_m
                     classified_path=classified_path,
                     confidence_path=confidence_path,
                     cfg=cfg,
@@ -378,25 +429,27 @@ def render() -> None:
                     run_id=run_id,
                     q=_q,
                     cancel_event=_ev,
+                    pixel_res_m=_pixel_res_capture,
+                    step_plan=_step_plan_capture,
                 ) -> None:
                     """Execute chain in background thread; communicate via queue."""
-                    _step_names  = [s for s, _ in _CHAIN_STEPS]
-                    _current_step = [0]  # mutable via closure
+                    _step_keys    = [s for s, _ in step_plan]
+                    _current_step = [0]
 
                     def _progress(msg: str) -> None:
                         step_idx = next(
-                            (i + 1 for i, s in enumerate(_step_names) if s in msg),
+                            (i + 1 for i, s in enumerate(_step_keys) if s in msg),
                             _current_step[0] + 1,
                         )
                         _current_step[0] = step_idx
                         ts = datetime.now().strftime("%H:%M:%S")
                         q.put({
                             "step":  step_idx,
-                            "total": len(_step_names),
+                            "total": len(_step_keys),
                             "msg":   msg,
                             "done":  False,
                             "error": None,
-                            "log":   f"[{ts}] Step {step_idx}/{len(_step_names)}: {msg}",
+                            "log":   f"[{ts}] Step {step_idx}/{len(_step_keys)}: {msg}",
                         })
 
                     try:
@@ -408,11 +461,12 @@ def render() -> None:
                             run_id          = run_id,
                             progress        = _progress,
                             cancel_event    = cancel_event,
+                            pixel_res_m     = pixel_res_m,
                         )
                         ts = datetime.now().strftime("%H:%M:%S")
                         q.put({
-                            "step":   len(_step_names),
-                            "total":  len(_step_names),
+                            "step":   len(_step_keys),
+                            "total":  len(_step_keys),
                             "msg":    "Chain complete",
                             "done":   True,
                             "error":  None,
@@ -423,7 +477,7 @@ def render() -> None:
                         ts = datetime.now().strftime("%H:%M:%S")
                         q.put({
                             "step":  0,
-                            "total": len(_step_names),
+                            "total": len(_step_keys),
                             "msg":   str(exc),
                             "done":  True,
                             "error": str(exc),
@@ -436,6 +490,7 @@ def render() -> None:
                 session.set_("chain_cancel_event", _ev)
                 session.set_("chain_log",          [])
                 session.set_("chain_start_time",   time.time())
+                session.set_("_chain_step_plan",   _step_plan_capture)
                 _t.start()
                 st.rerun()
 
@@ -453,8 +508,11 @@ def render() -> None:
             _start_t  = session.get("chain_start_time") or time.time()
             _elapsed  = time.time() - _start_t
             _log_msgs: list[str] = session.get("chain_log") or []
+            _active_steps: list[tuple[str, str]] = (
+                session.get("_chain_step_plan") or _CHAIN_STEPS_DEFAULT
+            )
             _last_step  = 0
-            _last_total = len(_CHAIN_STEPS)
+            _last_total = len(_active_steps)
             _done_msg   = None
 
             # Drain the queue
@@ -475,8 +533,8 @@ def render() -> None:
             # Render status panel
             _frac = min(1.0, _last_step / _last_total) if _last_total else 0.0
             _step_label = (
-                _CHAIN_STEPS[_last_step - 1][1]
-                if 0 < _last_step <= len(_CHAIN_STEPS)
+                _active_steps[_last_step - 1][1]
+                if 0 < _last_step <= len(_active_steps)
                 else "Starting…"
             )
             col_prog, col_time = st.columns([3, 1])
@@ -486,8 +544,8 @@ def render() -> None:
             with col_time:
                 st.metric("Elapsed", f"{_elapsed:.0f}s")
 
-            # Step checklist
-            for i, (_, slabel) in enumerate(_CHAIN_STEPS):
+            # Step checklist (dynamic — adapts to drone/satellite mode)
+            for i, (_, slabel) in enumerate(_active_steps):
                 if i < _last_step:
                     icon = "✅"
                 elif i == _last_step:
@@ -542,8 +600,9 @@ def render() -> None:
 
                     # Result summary
                     st.markdown("---")
-                    for i, (_, slabel) in enumerate(_CHAIN_STEPS):
-                        st.markdown(f"✅ Step {i+1}/4: {slabel}")
+                    _n_steps = len(_active_steps)
+                    for i, (_, slabel) in enumerate(_active_steps):
+                        st.markdown(f"✅ Step {i+1}/{_n_steps}: {slabel}")
                     st.markdown("─" * 40)
                     try:
                         _sz_mb = final_path.stat().st_size / (1024 * 1024)
@@ -557,7 +616,9 @@ def render() -> None:
                     )
 
             elif _chain_running:
-                time.sleep(0.5)
+                # 0.1 s is enough to avoid busy-spin; 0.5 s caused noticeable
+                # UI unresponsiveness because it blocked the Streamlit main thread.
+                time.sleep(0.1)
                 st.rerun()
 
         # ── Before / after comparison ─────────────────────────────────────
@@ -570,7 +631,6 @@ def render() -> None:
 
                 def _quick_areas(path: Path) -> dict[int, int] | None:
                     """Return {class: pixel_count} without computing ha."""
-                    from pipeline.postprocess import iter_windows as _iw
                     counts: dict[int, int] = {}
                     try:
                         with rasterio.open(path) as ds:
@@ -590,7 +650,6 @@ def render() -> None:
                     st.caption("**Before** (original classified)")
                     before_counts = _quick_areas(classified_path)
                     if before_counts:
-                        import pandas as pd
                         st.dataframe(
                             pd.DataFrame(
                                 [{"Class": k, "Pixels": v}
@@ -602,7 +661,6 @@ def render() -> None:
                     st.caption("**After** (chain final output)")
                     after_counts = _quick_areas(Path(final_chain_path))
                     if after_counts:
-                        import pandas as pd
                         st.dataframe(
                             pd.DataFrame(
                                 [{"Class": k, "Pixels": v}

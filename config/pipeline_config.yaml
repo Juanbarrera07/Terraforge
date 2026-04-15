@@ -61,3 +61,59 @@ sar_enl_sentinel1_iw: 4.9        # Sentinel-1 IW mode typical ENL
 # ── File handling ────────────────────────────────────────────────────────────
 upload_size_limit_mb: 500
 tmp_dir: tmp                       # relative to project root
+
+# ── Band map templates ────────────────────────────────────────────────────────
+band_templates:
+  sentinel2_l2a_10m:
+    blue:     2    # B02 10m
+    green:    3    # B03 10m
+    red:      4    # B04 10m
+    nir:      8    # B08 10m
+  sentinel2_l2a_20m:
+    blue:     1    # B02 resampled
+    green:    2    # B03
+    red:      3    # B04
+    red_edge: 4    # B05
+    nir:      7    # B8A
+    swir1:    8    # B11
+    swir2:    9    # B12
+  sentinel1_grd_dual:
+    vv:       1
+    vh:       2
+  drone_rgb:
+    red:      1
+    green:    2
+    blue:     3
+  drone_multispectral_5band:
+    blue:     1
+    green:    2
+    red:      3
+    red_edge: 4
+    nir:      5
+
+# ── Pit wall class definitions ────────────────────────────────────────────────
+pit_wall_classes:
+  0: "NoData / Shadow"
+  1: "Exposed Fresh Rock"
+  2: "Weathered / Oxidised Material"
+  3: "Instability Zone (Displacement Risk)"
+  4: "Vegetation Encroachment"
+  5: "Water / Seepage"
+
+# ── TSF class definitions ─────────────────────────────────────────────────────
+tsf_classes:
+  0: "NoData"
+  1: "Active Wet Tailings"
+  2: "Dry Beach (Oxidised)"
+  3: "Ponded Water"
+  4: "Rehabilitated Surface"
+  5: "Dust Risk Zone (Dry Fine Material)"
+  6: "Seepage / Discolouration Zone"
+
+# ── Drone-specific processing ─────────────────────────────────────────────────
+# (drone_pixel_res_threshold_m is already set above — not duplicated)
+drone_block_size: 256              # smaller tiles for high-res imagery
+drone_rgb_scale_to_float: true     # auto-scale uint8 bands before index computation
+
+# ── Mining-specific features ──────────────────────────────────────────────────
+mining_features_enabled: true      # enable iron_oxide, clay_index, ferrous, mndwi

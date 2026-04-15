@@ -8,6 +8,7 @@ mirrored to st.session_state.audit_log for in-app display.
 Event types
 -----------
 run_start      New run initialised.
+config_snapshot Full pipeline configuration captured for reproducibility.
 ingestion      File ingested successfully.
 gate           Validation / quality gate evaluated (includes decision field).
 decision       Explicit user choice (e.g. "override warning and proceed").
@@ -83,6 +84,26 @@ def log_event(
     log.append(entry)
     _write(run_id, log)
     return entry
+
+
+def log_config_snapshot(run_id: str, config: dict) -> None:
+    """
+    Write a one-time configuration snapshot event for ``run_id``.
+
+    If a snapshot for the run already exists, no duplicate event is written.
+    """
+    log = _read(run_id)
+    if any(entry.get("event_type") == "config_snapshot" for entry in log):
+        return
+
+    entry: dict[str, Any] = {
+        "timestamp": _now(),
+        "run_id": run_id,
+        "event_type": "config_snapshot",
+        "details": config,
+    }
+    log.append(entry)
+    _write(run_id, log)
 
 
 def append_to_session(entry: dict[str, Any]) -> None:

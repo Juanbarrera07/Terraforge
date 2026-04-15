@@ -24,6 +24,10 @@ tmp/
 outputs/
 logs/
 *.log
+data/raw/
+*.pkl
+.pytest_cache/
+models/
 
 # Streamlit
 .streamlit/secrets.toml

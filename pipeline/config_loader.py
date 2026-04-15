@@ -28,6 +28,14 @@ _DEFAULTS: dict[str, Any] = {
     "drone_median_kernel_max": 7,
     "drone_morpho_iterations": 2,
     "drone_sieve_min_px": 100,
+    # Drone adaptive smoothing (used by drone_adaptive_params)
+    "drone_smooth_target_fine_m": 0.3,
+    "drone_smooth_target_medium_m": 1.5,
+    "drone_smooth_target_coarse_m": 3.0,
+    "drone_morpho_target_m": 0.75,
+    "drone_sieve_target_m2": 1.0,
+    "drone_max_median_kernel": 31,
+    "drone_max_morpho_kernel": 11,
     # Training
     "default_k_folds": 5,
     "smote_auto_threshold_pct": 10,
